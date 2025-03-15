@@ -157,7 +157,7 @@ class FPVSImageResizerApp:
         about_frame = ttk.Frame(notebook)
         notebook.add(about_frame, text="About")
         self._create_scrollable_text(about_frame,
-            "FPVS Image Resizer\nVersion 1.0\n\n"
+            "FPVS Image Resizer\nVersion 0.5\n\n"
             "Developer: Zack Murphy\nEmail: zmurphy@abe.msstate.edu"
         )
 
