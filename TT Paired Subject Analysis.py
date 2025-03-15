@@ -1,3 +1,6 @@
+# Analyzes two subfolders with the SAME SUBJECTS in both folders. Paired differences analysis.
+# Generates an excel file with all the useful statistical information.
+
 import os
 import pandas as pd
 import numpy as np
