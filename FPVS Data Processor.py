@@ -29,10 +29,11 @@ class FPVSApp(tk.Tk):
         self.geometry("900x700")
 
         # Data structures to hold preprocessed data
-        #   key: condition name in lower-case
-        #   val: list of MNE Epochs objects (one per participant/file)
-        self.preprocessed_data = {}
-        self.condition_names_gui = []
+        self.preprocessed_data = {}    # { condition_name_lower: [list of Epochs] }
+        self.condition_names_gui = []  # original condition names from the GUI
+
+        # Will store the user-selected file paths (single mode) or list of files (batch mode)
+        self.data_paths = []
 
         self.create_widgets()
 
@@ -44,7 +45,7 @@ class FPVSApp(tk.Tk):
           - Condition entry fields
           - Excel output location
           - Logging text box
-          - Start Processing button
+          - Buttons for file/folder selection and "Start Processing"
         """
         # ========== Top Frame: Processing Options ==========
         options_frame = ttk.LabelFrame(self, text="Processing Options")
@@ -55,12 +56,18 @@ class FPVSApp(tk.Tk):
         ttk.Label(options_frame, text="File Processing Mode:").grid(
             row=0, column=0, sticky="w", padx=5, pady=2
         )
-        ttk.Radiobutton(
-            options_frame, text="Single File", variable=self.file_mode, value="Single"
-        ).grid(row=0, column=1, padx=5)
-        ttk.Radiobutton(
-            options_frame, text="Batch Processing", variable=self.file_mode, value="Batch"
-        ).grid(row=0, column=2, padx=5)
+        self.radio_single = ttk.Radiobutton(
+            options_frame, text="Single File",
+            variable=self.file_mode, value="Single",
+            command=self.update_select_button_text
+        )
+        self.radio_single.grid(row=0, column=1, padx=5)
+        self.radio_batch = ttk.Radiobutton(
+            options_frame, text="Batch Processing",
+            variable=self.file_mode, value="Batch",
+            command=self.update_select_button_text
+        )
+        self.radio_batch.grid(row=0, column=2, padx=5)
 
         # File Type: .BDF or .set
         self.file_type = tk.StringVar(value=".BDF")
@@ -145,7 +152,8 @@ class FPVSApp(tk.Tk):
 
         # Button to add another condition
         ttk.Button(
-            conditions_frame, text="Add Another Condition", command=self.add_condition_entry
+            conditions_frame, text="Add Another Condition",
+            command=self.add_condition_entry
         ).pack(pady=5)
 
         # ========== Save Location for Excel Output ==========
@@ -167,8 +175,17 @@ class FPVSApp(tk.Tk):
         self.log_text = tk.Text(log_frame, height=15)
         self.log_text.pack(fill="both", expand=True)
 
+        # ========== Dynamic File/Folder Selection Button ==========
+        self.select_button_text = tk.StringVar()
+        self.select_button = ttk.Button(
+            self, textvariable=self.select_button_text,
+            command=self.select_data_source
+        )
+        self.select_button.pack(pady=5)
+        self.update_select_button_text()  # set initial text
+
         # ========== Start Processing Button ==========
-        ttk.Button(self, text="Start Processing", command=self.start_processing).pack(pady=10)
+        ttk.Button(self, text="Start Processing", command=self.start_processing).pack(pady=5)
 
     def add_condition_entry(self):
         """Dynamically add a new text entry for condition name."""
@@ -186,6 +203,46 @@ class FPVSApp(tk.Tk):
                 f"Subfolders will be created under:\n{folder}"
             )
 
+    def update_select_button_text(self):
+        """Update the button text based on whether the user wants single or batch processing."""
+        if self.file_mode.get() == "Single":
+            self.select_button_text.set("Select file to process")
+        else:
+            self.select_button_text.set("Select folder containing FPVS data files")
+
+    def select_data_source(self):
+        """
+        Prompt the user to either select a single file or a folder,
+        depending on the file_mode. Store the results in self.data_paths.
+        """
+        self.data_paths = []  # clear previous selection
+        file_ext = "*" + self.file_type.get().lower()
+
+        if self.file_mode.get() == "Single":
+            # Prompt user for one file
+            file_path = filedialog.askopenfilename(
+                title="Select EEG File",
+                filetypes=[(self.file_type.get(), file_ext)]
+            )
+            if file_path:
+                self.data_paths = [file_path]
+                self.log(f"Selected single file: {file_path}")
+            else:
+                self.log("No file selected.")
+        else:
+            # Prompt user for a folder containing multiple files
+            folder = filedialog.askdirectory(title="Select Folder Containing EEG Files")
+            if folder:
+                found_files = glob.glob(os.path.join(folder, file_ext))
+                if found_files:
+                    self.data_paths = found_files
+                    self.log(f"Selected folder: {folder}")
+                    self.log(f"Found {len(found_files)} file(s) matching '{file_ext}'.")
+                else:
+                    self.log(f"No files found in {folder} matching '{file_ext}'.")
+            else:
+                self.log("No folder selected.")
+
     def log(self, message):
         """Append a message to the logging text box."""
         self.log_text.insert(tk.END, message + "\n")
@@ -195,9 +252,15 @@ class FPVSApp(tk.Tk):
     def start_processing(self):
         """
         Triggered by the "Start Processing" button.
-        Handles file selection, runs preprocessing, then post-processing.
+        Runs preprocessing and then post-processing
+        on the user-selected file(s).
         """
         self.log("Starting processing...")
+
+        # If user hasn't selected any file/folder, warn them
+        if not self.data_paths:
+            messagebox.showerror("Selection Error", "No file or folder selected. Please select a data source first.")
+            return
 
         # Retrieve numeric parameters
         try:
@@ -222,44 +285,16 @@ class FPVSApp(tk.Tk):
 
         self.log(f"Conditions for extraction: {conditions_extract}")
 
-        # Determine file extension filter
-        file_ext = "*" + self.file_type.get().lower()
-        files = []
-
-        # Single vs. Batch selection
-        if self.file_mode.get() == "Single":
-            # Prompt user for one file
-            file_path = filedialog.askopenfilename(
-                title="Select EEG File",
-                filetypes=[(self.file_type.get(), file_ext)]
-            )
-            if not file_path:
-                self.log("No file selected. Aborting.")
-                return
-            files = [file_path]
-        else:
-            # Prompt user for a folder containing multiple files
-            folder = filedialog.askdirectory(title="Select Folder Containing EEG Files")
-            if not folder:
-                self.log("No folder selected. Aborting.")
-                return
-            files = glob.glob(os.path.join(folder, file_ext))
-            if not files:
-                self.log("No EEG files found in the selected folder. Aborting.")
-                return
-
-        self.log(f"Selected {len(files)} file(s) for processing.")
-
-        # Initialize dict to store preprocessed data per condition
+        # Clear any previous preprocessed data
         self.preprocessed_data = {cond: [] for cond in conditions_extract}
 
         # ==========================
         # Preprocessing Phase
         # ==========================
-        for file in files:
-            self.log(f"Processing file: {os.path.basename(file)}")
+        for file_path in self.data_paths:
+            self.log(f"Processing file: {os.path.basename(file_path)}")
             try:
-                raw = self.load_eeg_file(file)
+                raw = self.load_eeg_file(file_path)
                 raw = self.preprocess_raw(raw, downsample_rate, low_pass, high_pass, reject_thresh)
 
                 # Extract epochs for each condition
@@ -271,32 +306,31 @@ class FPVSApp(tk.Tk):
                 for cond_gui, cond_extract in zip(conditions_gui, conditions_extract):
                     try:
                         # Attempt to create epochs for the given condition
-                        # If condition not in event_id, this will be None
                         target_id = event_id.get(cond_extract, None)
-                        epochs = mne.Epochs(raw, events, event_id={cond_extract: target_id},
-                                            tmin=epoch_start, tmax=epoch_end,
-                                            preload=True, verbose=False)
+                        epochs = mne.Epochs(
+                            raw, events, event_id={cond_extract: target_id},
+                            tmin=epoch_start, tmax=epoch_end,
+                            preload=True, verbose=False
+                        )
                         if len(epochs) == 0:
                             self.log(
                                 f"Warning: No epochs found for '{cond_gui}' (searched as '{cond_extract}')"
                             )
                         else:
-                            self.log(
-                                f"Extracted {len(epochs)} epochs for '{cond_gui}'"
-                            )
+                            self.log(f"Extracted {len(epochs)} epochs for '{cond_gui}'")
                             self.preprocessed_data[cond_extract].append(epochs)
                     except Exception as e:
                         self.log(f"Error extracting epochs for '{cond_gui}': {e}")
 
                 # Optionally save the preprocessed file
                 if self.save_preprocessed.get():
-                    save_filename = os.path.splitext(os.path.basename(file))[0] + "_preproc.fif"
-                    save_path = os.path.join(os.path.dirname(file), save_filename)
+                    save_filename = os.path.splitext(os.path.basename(file_path))[0] + "_preproc.fif"
+                    save_path = os.path.join(os.path.dirname(file_path), save_filename)
                     raw.save(save_path, overwrite=True)
                     self.log(f"Saved preprocessed file to: {save_path}")
 
             except Exception as e:
-                self.log(f"Error processing file {os.path.basename(file)}: {e}")
+                self.log(f"Error processing file {os.path.basename(file_path)}: {e}")
 
         self.log("Preprocessing phase complete.")
 
@@ -510,7 +544,7 @@ class FPVSApp(tk.Tk):
             with pd.ExcelWriter(excel_path) as writer:
                 df_fft.to_excel(writer, sheet_name="FFT",    index=False)
                 df_snr.to_excel(writer, sheet_name="SNR",    index=False)
-                df_z.to_excel(writer,   sheet_name="Z-score",index=False)
+                df_z.to_excel(writer, sheet_name="Z-score", index=False)
                 df_bca.to_excel(writer, sheet_name="BCA",    index=False)
 
             self.log(f"Excel results saved for condition '{cond_folder_name}' at: {excel_path}")
