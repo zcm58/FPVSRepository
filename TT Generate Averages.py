@@ -1,3 +1,5 @@
+# Averages the variables of two subfolders together to create an average of them both.
+
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk

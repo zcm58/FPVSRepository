@@ -1,7 +1,3 @@
-# Allows you to easily aggregate data onto one excel sheet for
-# Graphing purposes.
-
-
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
@@ -9,6 +5,7 @@ import os
 import openpyxl
 import csv
 import re
+import xlwings as xw
 
 # -------------------------------------------------------------------
 # 1) Define the list of variables in the desired order
@@ -58,13 +55,16 @@ def select_folder():
     folder_path_entry.insert(0, folder_path)
 
 def select_output_excel():
-    """Opens a file dialog to select the output Excel file."""
+    """Opens a file dialog to select the existing output Excel file."""
     output_file_path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx;*.xls")])
     output_file_entry.delete(0, tk.END)
     output_file_entry.insert(0, output_file_path)
 
 def extract_and_write():
-    """Extracts data from the chosen variable (mapped to a cell) and writes to the specified column/row range."""
+    """Extracts data from the chosen variable (mapped to a cell) in each input file,
+    verifies that each expected file (from Column A in the output workbook) is present,
+    and updates the existing Excel workbook using xlwings (so that charts and other
+    Excel features are preserved)."""
     folder_path = folder_path_entry.get()
     output_file_path = output_file_entry.get()
     chosen_variable = variable_var.get()  # The selected variable from the dropdown
@@ -75,59 +75,68 @@ def extract_and_write():
         messagebox.showerror("Error", "Please fill in all fields.")
         return
 
+    # Check that the output file exists
+    if not os.path.exists(output_file_path):
+        messagebox.showerror("Error", f"Output file not found: {output_file_path}")
+        return
+
     # Look up the corresponding cell reference for the chosen variable
     cell_to_extract = variable_cell_map.get(chosen_variable, None)
     if not cell_to_extract:
         messagebox.showerror("Error", f"No cell mapping found for {chosen_variable}")
         return
 
-    # Parse the row range (e.g. "2:10") into start_row and end_row
+    # Parse the row range (e.g. "2:12") into start_row and end_row
     try:
         start_row_str, end_row_str = row_range_str.split(':')
         start_row = int(start_row_str)
         end_row = int(end_row_str)
     except ValueError:
-        messagebox.showerror("Error", "Invalid row range format. Use something like '2:10'.")
+        messagebox.showerror("Error", "Invalid row range format. Use something like '2:12'.")
         return
 
     try:
-        output_wb = openpyxl.load_workbook(output_file_path)
-        output_sheet = output_wb.active
+        # Open the existing workbook using xlwings
+        output_wb = xw.Book(output_file_path)
+        output_sheet = output_wb.sheets[0]
 
-        # List files with supported extensions that start with capital 'P'
-        files = [f for f in os.listdir(folder_path)
-                 if f.startswith("P") and f.lower().endswith(('.xlsx', '.xls', '.csv'))]
-        if not files:
-            messagebox.showerror("Error", "No matching Excel/CSV files found in the selected folder.")
+        # -----------------------------------------------------------
+        # New functionality: Verify that files exist for each expected identifier.
+        # Read the expected identifiers from Column A in the given row range.
+        # -----------------------------------------------------------
+        expected_ids = output_sheet.range(f"A{start_row}:A{end_row}").value
+        if not isinstance(expected_ids, list):
+            expected_ids = [expected_ids]
+        # Get all files in the folder with supported extensions.
+        folder_files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.xlsx', '.xls', '.csv'))]
+        mapping = {}
+        missing_ids = []
+        for identifier in expected_ids:
+            if identifier is None or str(identifier).strip() == "":
+                missing_ids.append("Empty cell")
+                continue
+            # Search for a file whose name contains the identifier string.
+            matches = [f for f in folder_files if str(identifier) in f]
+            if not matches:
+                missing_ids.append(str(identifier))
+            else:
+                mapping[str(identifier)] = matches[0]  # take the first match
+
+        if missing_ids:
+            messagebox.showerror("Error", f"Missing files for identifiers: {', '.join(missing_ids)}")
+            output_wb.close()
             return
-
-        # Sort files based on the numeric value after 'P' to ensure correct numerical order
-        def sort_key(file_name):
-            match = re.search(r'^P(\d+)', file_name)
-            if match:
-                return int(match.group(1))
-            return float('inf')
-        files.sort(key=sort_key)
-
-        # Convert the output column letters to a column index
-        try:
-            output_col_index = openpyxl.utils.column_index_from_string(output_col_letters)
-        except ValueError:
-            messagebox.showerror("Error", f"Invalid column letters: {output_col_letters}")
-            return
-
-        # Ensure the user-provided row range can hold all files
-        required_end_row = start_row + len(files) - 1
-        if end_row < required_end_row:
-            messagebox.showerror("Error", f"The output row range is too small. It must extend to at least row {required_end_row}.")
-            return
-
-        # Process each file in sorted order
-        for row_offset, file in enumerate(files):
-            full_file_path = os.path.join(folder_path, file)
+        # -----------------------------------------------------------
+        # Now process each row based on the expected identifiers.
+        # -----------------------------------------------------------
+        for i, identifier in enumerate(expected_ids):
+            current_row = start_row + i
+            # Use the mapping to get the corresponding file.
+            file_name = mapping.get(str(identifier))
+            full_file_path = os.path.join(folder_path, file_name)
             try:
-                # For Excel files
-                if file.lower().endswith(('.xlsx', '.xls')):
+                # For Excel files, use openpyxl to extract the value
+                if file_name.lower().endswith(('.xlsx', '.xls')):
                     input_wb = openpyxl.load_workbook(full_file_path, data_only=True)
                     input_sheet = input_wb.active
                     extracted_value = input_sheet[cell_to_extract].value
@@ -146,41 +155,46 @@ def extract_and_write():
                 try:
                     numeric_value = float(extracted_value)
                 except (ValueError, TypeError) as e:
-                    messagebox.showerror("Error", f"Value '{extracted_value}' in {file} cannot be converted to a number: {e}")
+                    messagebox.showerror("Error", f"Value '{extracted_value}' in file {file_name} cannot be converted to a number: {e}")
+                    output_wb.close()
                     return
 
-                # Write the numeric value to the output Excel file in the chosen column
-                current_row = start_row + row_offset
-                output_sheet.cell(row=current_row, column=output_col_index, value=numeric_value)
+                # Write the numeric value to the output Excel file in the chosen column, on the same row.
+                cell_address = f"{output_col_letters}{current_row}"
+                output_sheet.range(cell_address).value = numeric_value
 
             except FileNotFoundError:
                 messagebox.showerror("Error", f"Input file not found: {full_file_path}")
+                output_wb.close()
+                return
             except (KeyError, IndexError):
-                messagebox.showerror("Error", f"Cell {cell_to_extract} not found in {file}")
+                messagebox.showerror("Error", f"Cell {cell_to_extract} not found in file {file_name}")
+                output_wb.close()
+                return
             except Exception as e:
-                messagebox.showerror("Error", f"Unexpected error processing {file}: {e}")
+                messagebox.showerror("Error", f"Unexpected error processing file {file_name}: {e}")
+                output_wb.close()
+                return
 
-        # Auto-adjust column widths and center-align the cell content
-        for column in output_sheet.columns:
-            max_length = 0
-            column_letter = column[0].column_letter
-            for cell in column:
-                try:
-                    if cell.value and len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = max_length + 4
-            output_sheet.column_dimensions[column_letter].width = adjusted_width
+        # Auto-adjust column widths for the entire used range
+        output_sheet.api.Columns.AutoFit()
 
-        for row in output_sheet.rows:
-            for cell in row:
-                cell.alignment = openpyxl.styles.Alignment(horizontal='center')
+        # Center-align the updated cells in the output column
+        updated_range = output_sheet.range(f"{output_col_letters}{start_row}:{output_col_letters}{end_row}")
+        updated_range.api.HorizontalAlignment = -4108  # -4108 corresponds to center alignment in Excel COM
 
-        output_wb.save(output_file_path)
-        messagebox.showinfo("Success", "Data extracted and written successfully.")
-    except FileNotFoundError:
-        messagebox.showerror("Error", f"Output file not found: {output_file_path}")
+        # Save the workbook without closing it
+        # (If the workbook is already open, we get that instance; otherwise, we open it)
+        for book in xw.books:
+            if book.fullname.lower() == output_file_path.lower():
+                output_wb = book
+                break
+        else:
+            output_wb = xw.Book(output_file_path)
+
+        output_wb.save()
+        messagebox.showinfo("Success", "Data extracted and updated successfully.")
+
     except Exception as e:
         messagebox.showerror("Error", f"An unexpected error occurred: {e}")
 
@@ -192,7 +206,6 @@ def toggle_theme():
     global dark_mode
     dark_mode = not dark_mode
     if dark_mode:
-        # Switch to dark theme using the 'alt' theme as a base
         style.theme_use("alt")
         style.configure('.', background='#2d2d2d', foreground='#ffffff')
         style.configure('TLabel', background='#2d2d2d', foreground='#ffffff')
@@ -202,7 +215,6 @@ def toggle_theme():
         root.configure(bg='#2d2d2d')
         toggle_btn.config(text="Switch to Light Mode")
     else:
-        # Switch back to light theme using the 'clam' theme
         style.theme_use("clam")
         style.configure('.', background='#f0f0f0', foreground='#000000')
         style.configure('TLabel', background='#f0f0f0', foreground='#000000')
@@ -238,7 +250,6 @@ ttk.Button(root, text="Browse", command=select_output_excel).grid(row=1, column=
 ttk.Label(root, text="Variable to Extract:").grid(row=2, column=0, sticky="w", **pad_opts)
 variable_var = tk.StringVar(root)
 variable_var.set(VARIABLES[0])
-# Set a wider combobox width so all text is visible
 variable_dropdown = ttk.Combobox(root, textvariable=variable_var, values=VARIABLES, state="readonly", width=60)
 variable_dropdown.current(0)
 variable_dropdown.grid(row=2, column=1, **pad_opts, sticky="w")
@@ -247,7 +258,7 @@ ttk.Label(root, text="Output Column (e.g., F):").grid(row=3, column=0, sticky="w
 output_col_entry = ttk.Entry(root, width=5)
 output_col_entry.grid(row=3, column=1, sticky="w", **pad_opts)
 
-ttk.Label(root, text="Output Row Range (e.g., 2:10):").grid(row=4, column=0, sticky="w", **pad_opts)
+ttk.Label(root, text="Output Row Range (e.g., 2:12):").grid(row=4, column=0, sticky="w", **pad_opts)
 output_row_range_entry = ttk.Entry(root, width=10)
 output_row_range_entry.grid(row=4, column=1, sticky="w", **pad_opts)
 
