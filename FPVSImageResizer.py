@@ -7,6 +7,9 @@ from tkinter import filedialog, messagebox
 from tkinter import ttk
 from PIL import Image
 import sv_ttk  # Import the Sun Valley theme library
+import requests  # Added to check for updates
+
+__version__ = "0.6"  # Embedded App version
 
 # Set DPI awareness on Windows
 if sys.platform.startswith('win'):
@@ -118,6 +121,7 @@ class FPVSImageResizerApp:
 
         # File Menu
         file_menu = tk.Menu(menubar, tearoff=False)
+        file_menu.add_command(label="Check for Updates", command=self.check_for_updates)  # New update command
         file_menu.add_command(label="Exit", command=self.master.quit)
         menubar.add_cascade(label="File", menu=file_menu)
 
@@ -127,6 +131,23 @@ class FPVSImageResizerApp:
         menubar.add_cascade(label="Help", menu=help_menu)
 
         self.master.config(menu=menubar)
+
+    def check_for_updates(self):
+        try:
+            url = "https://api.github.com/repos/zcm58/FPVSRepository/releases/latest"
+            response = requests.get(url)
+            if response.status_code == 404:
+                messagebox.showerror("Error", "This app was not found on github. Please contact the app developer, Zack Murphy, for access to the latest version of the FPVS Image Resizer.")
+                return
+            response.raise_for_status()
+            latest_version = response.json().get("tag_name", __version__)
+            if latest_version != __version__:
+                messagebox.showinfo("Update Available",
+                                    f"A new version ({latest_version}) is available! You are running version {__version__}.")
+            else:
+                messagebox.showinfo("Up to Date", "You are using the latest version.")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to check for updates:\n{e}")
 
     def show_help_window(self):
         help_win = tk.Toplevel(self.master)
@@ -157,7 +178,7 @@ class FPVSImageResizerApp:
         about_frame = ttk.Frame(notebook)
         notebook.add(about_frame, text="About")
         self._create_scrollable_text(about_frame,
-            "FPVS Image Resizer\nVersion 0.5\n\n"
+            "FPVS Image Resizer\nVersion 0.6\n\n"
             "Developer: Zack Murphy\nEmail: zmurphy@abe.msstate.edu"
         )
 
@@ -280,6 +301,9 @@ class FPVSImageResizerApp:
             messagebox.showinfo("Notice", "Ah. You don't follow the rules. I guess you can select your own folder.")
             folder = filedialog.askdirectory(initialdir=self.input_folder, title="Select output folder for saving images")
             if folder:
+                if os.path.abspath(folder) == os.path.abspath(self.input_folder):
+                    messagebox.showerror("Error", "Output folder cannot be the same location as the input folder. Please choose another location to save your resized images.")
+                    return
                 self.output_folder = folder
                 self.output_label.config(text=f"Output Folder: {folder}")
 
@@ -317,12 +341,8 @@ class FPVSImageResizerApp:
         # Check for same input and output folder
         if hasattr(self, 'input_folder') and hasattr(self, 'output_folder'):
             if os.path.abspath(self.input_folder) == os.path.abspath(self.output_folder):
-                answer = messagebox.askyesno(
-                    "Same Folder Warning",
-                    "You selected the same folder for input and output. Existing files may be overwritten.\n\nContinue?"
-                )
-                if not answer:
-                    return
+                messagebox.showerror("Error", "Output folder cannot be the same location as the input folder. Please choose another location to save your resized images.")
+                return
 
         self.cancel_requested = False
         self.cancel_button.config(state="normal")
