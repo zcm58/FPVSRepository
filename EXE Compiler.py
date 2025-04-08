@@ -1,3 +1,6 @@
+# easy way to quickly compile new app versions into an .exe file
+# allows you to choose an app icon for compilation
+
 import os
 import sys
 import subprocess
