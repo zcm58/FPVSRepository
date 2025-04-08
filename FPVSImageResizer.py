@@ -8,8 +8,9 @@ from tkinter import ttk
 from PIL import Image
 import sv_ttk  # Import the Sun Valley theme library
 import requests  # Added to check for updates
+from packaging.version import parse as version_parse  # New import for semantic version comparison
 
-__version__ = "0.6"  # Embedded App version
+__version__ = "0.6.2"  # Embedded App version
 
 # Set DPI awareness on Windows
 if sys.platform.startswith('win'):
@@ -137,13 +138,23 @@ class FPVSImageResizerApp:
             url = "https://api.github.com/repos/zcm58/FPVSRepository/releases/latest"
             response = requests.get(url)
             if response.status_code == 404:
-                messagebox.showerror("Error", "This app was not found on github. Please contact the app developer, Zack Murphy, for access to the latest version of the FPVS Image Resizer.")
+                messagebox.showerror("Error", "This app was not found on GitHub. Please contact the app developer, Zack Murphy, for access to the latest version of the FPVS Image Resizer.")
                 return
             response.raise_for_status()
             latest_version = response.json().get("tag_name", __version__)
-            if latest_version != __version__:
-                messagebox.showinfo("Update Available",
-                                    f"A new version ({latest_version}) is available! You are running version {__version__}.")
+            local_version = version_parse(__version__)
+            remote_version = version_parse(latest_version)
+            if remote_version > local_version:
+                # Prompt the user to open GitHub page for manual update
+                answer = messagebox.askyesno(
+                    "Update Available",
+                    f"A new version ({latest_version}) is available! You are running version {__version__}.\n\n"
+                    "Would you like to open the GitHub releases page to download the update?\n"
+                    "It is safe to delete the old version after downloading the new version."
+                )
+                if answer:
+                    import webbrowser
+                    webbrowser.open("https://github.com/zcm58/FPVSRepository/releases")
             else:
                 messagebox.showinfo("Up to Date", "You are using the latest version.")
         except Exception as e:
@@ -178,7 +189,7 @@ class FPVSImageResizerApp:
         about_frame = ttk.Frame(notebook)
         notebook.add(about_frame, text="About")
         self._create_scrollable_text(about_frame,
-            "FPVS Image Resizer\nVersion 0.6\n\n"
+            "FPVS Image Resizer\nBeta Version 0.6.2\n"
             "Developer: Zack Murphy\nEmail: zmurphy@abe.msstate.edu"
         )
 
