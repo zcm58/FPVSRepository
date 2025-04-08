@@ -3,6 +3,8 @@ import subprocess
 import threading
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from PIL import Image
+import sv_ttk  # Import the Sun Valley theme library
 
 
 class CompilerGUI:
@@ -44,9 +46,22 @@ class CompilerGUI:
         self.browse_version_button = ttk.Button(frame_version, text="Browse", command=self.browse_version_file)
         self.browse_version_button.pack(side="left", padx=5, pady=5)
 
-        # --- Build Button ---
-        self.build_button = ttk.Button(master, text="Build Executable", command=self.start_build)
-        self.build_button.pack(pady=10)
+        # --- App Icon Selection ---
+        frame_icon = ttk.LabelFrame(master, text="App Icon (png, jpg, jpeg)")
+        frame_icon.pack(fill="x", padx=10, pady=5)
+        self.icon_file_entry = ttk.Entry(frame_icon, width=50)
+        self.icon_file_entry.pack(side="left", padx=5, pady=5)
+        self.browse_icon_button = ttk.Button(frame_icon, text="Browse", command=self.browse_icon_file)
+        self.browse_icon_button.pack(side="left", padx=5, pady=5)
+
+        # --- Build and Open Directory Buttons ---
+        frame_buttons = ttk.Frame(master)
+        frame_buttons.pack(pady=10)
+        self.build_button = ttk.Button(frame_buttons, text="Build Executable", command=self.start_build)
+        self.build_button.pack(side="left", padx=5)
+        self.open_dist_button = ttk.Button(frame_buttons, text="Open Compiled Directory",
+                                           command=self.open_compiled_directory)
+        self.open_dist_button.pack(side="left", padx=5)
 
         # --- Output Log ---
         self.output_text = tk.Text(master, height=10)
@@ -65,9 +80,47 @@ class CompilerGUI:
             self.version_file_entry.delete(0, tk.END)
             self.version_file_entry.insert(0, file_path)
 
+    def browse_icon_file(self):
+        file_path = filedialog.askopenfilename(title="Select App Icon",
+                                               filetypes=[("Image Files", "*.png;*.jpg;*.jpeg")])
+        if file_path:
+            self.icon_file_entry.delete(0, tk.END)
+            self.icon_file_entry.insert(0, file_path)
+
     def start_build(self):
         self.build_button.config(state="disabled")
         threading.Thread(target=self.build_executable, daemon=True).start()
+
+    def convert_icon(self, icon_path):
+        # Open the image and ensure it's in RGBA mode
+        try:
+            img = Image.open(icon_path)
+        except Exception as e:
+            self.log_output("Error opening icon image: " + str(e))
+            return None
+        if img.mode != "RGBA":
+            img = img.convert("RGBA")
+        # Crop to a centered square
+        width, height = img.size
+        min_dim = min(width, height)
+        left = (width - min_dim) // 2
+        top = (height - min_dim) // 2
+        box = (left, top, left + min_dim, top + min_dim)
+        img_cropped = img.crop(box)
+        # Resize cropped image to 24x24
+        img_small = img_cropped.resize((24, 24), Image.LANCZOS)
+        # Create a new 40x40 transparent image
+        img_icon = Image.new("RGBA", (40, 40), (0, 0, 0, 0))
+        offset = ((40 - 24) // 2, (40 - 24) // 2)
+        img_icon.paste(img_small, offset)
+        # Save to a temporary .ico file
+        temp_icon_path = "temp_icon.ico"
+        try:
+            img_icon.save(temp_icon_path, format="ICO")
+        except Exception as e:
+            self.log_output("Error saving temporary icon file: " + str(e))
+            return None
+        return temp_icon_path
 
     def build_executable(self):
         main_file = self.main_file_entry.get().strip()
@@ -75,6 +128,7 @@ class CompilerGUI:
         onefile = self.onefile_var.get()
         windowed = self.windowed_var.get()
         version_file = self.version_file_entry.get().strip()
+        icon_file = self.icon_file_entry.get().strip()
 
         if not os.path.isfile(main_file):
             self.log_output("Error: Main file not found.")
@@ -92,6 +146,15 @@ class CompilerGUI:
                 command.extend(["--version-file", version_file])
             else:
                 self.log_output("Warning: Version file not found. Ignoring version file option.")
+        if icon_file:
+            if os.path.isfile(icon_file):
+                temp_icon = self.convert_icon(icon_file)
+                if temp_icon:
+                    command.extend(["--icon", temp_icon])
+                else:
+                    self.log_output("Warning: Failed to convert icon. Proceeding without an icon.")
+            else:
+                self.log_output("Warning: Icon file not found. Ignoring icon option.")
         command.append(main_file)
 
         self.log_output("Running command: " + " ".join(command))
@@ -109,6 +172,21 @@ class CompilerGUI:
         except Exception as e:
             self.log_output("Build failed: " + str(e))
         self.build_button.config(state="normal")
+
+    def open_compiled_directory(self):
+        dist_path = os.path.join(os.getcwd(), "dist")
+        if os.path.exists(dist_path):
+            try:
+                if os.name == "nt":
+                    os.startfile(dist_path)
+                elif sys.platform.startswith("darwin"):
+                    subprocess.call(["open", dist_path])
+                else:
+                    subprocess.call(["xdg-open", dist_path])
+            except Exception as e:
+                messagebox.showerror("Error", "Unable to open the directory: " + str(e))
+        else:
+            messagebox.showerror("Error", "Compiled directory ('dist') not found.")
 
     def log_output(self, message):
         self.output_text.insert(tk.END, message + "\n")
