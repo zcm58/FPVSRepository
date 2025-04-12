@@ -7,6 +7,7 @@ import pandas as pd
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from scipy.stats import kurtosis
+import sv_ttk
 
 #####################################################
 # Fixed parameters for post-processing
@@ -551,5 +552,39 @@ class FPVSApp(tk.Tk):
 
 
 if __name__ == "__main__":
-    app = FPVSApp()
-    app.mainloop()
+    # Enable DPI awareness for high-resolution displays
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1) # For newer versions of Windows
+    except AttributeError:
+        pass # Handle older versions of Windows where this might not exist
+
+    import sv_ttk
+    root = FPVSApp()
+
+    try:
+        import darkdetect
+        sv_ttk.set_theme(darkdetect.theme())
+    except ImportError:
+        sv_ttk.set_theme("dark") # Default to dark if darkdetect is not installed
+
+    import sys
+    if sys.platform.startswith('win'):
+        try:
+            import pywinstyles
+            def apply_theme_to_titlebar(root_window):
+                version = sys.getwindowsversion()
+                if version.major == 10 and version.build >= 22000:
+                    # Set the title bar color to the background color on Windows 11
+                    titlebar_color = "#292929" if sv_ttk.get_theme() == "dark" else "#f0f0f0" # Adjusted colors for better match
+                    pywinstyles.change_header_color(root_window, titlebar_color)
+                elif version.major == 10:
+                    pywinstyles.apply_style(root_window, "dark" if sv_ttk.get_theme() == "dark" else "normal")
+                    # A hacky way to update the title bar's color on Windows 10
+                    root_window.wm_attributes("-alpha", 0.99)
+                    root_window.wm_attributes("-alpha", 1)
+            apply_theme_to_titlebar(root)
+        except ImportError:
+            pass # pywinstyles not installed
+
+    root.mainloop()
