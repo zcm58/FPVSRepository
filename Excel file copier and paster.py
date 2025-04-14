@@ -1,3 +1,8 @@
+## GUI based extraction of variables from table tennis excel sheets.
+## Allows the user to pick the variable they want to extract from a group of excel sheets,
+## and then write it to their chosen cells in a different excel sheet. Works even if new excel sheet is open.
+
+
 import tkinter as tk
 from tkinter import filedialog, messagebox
 from tkinter import ttk
