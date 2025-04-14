@@ -1,4 +1,5 @@
 # Averages the variables of two subfolders together to create an average of them both.
+# At this time, you must have already generated the excel file results via MATLAB? for this code to work.
 
 import tkinter as tk
 from tkinter import filedialog, messagebox
