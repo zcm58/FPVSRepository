@@ -3,24 +3,27 @@
 """
 EEG FPVS Analysis GUI using MNE-Python and CustomTkinter.
 
-Version: 1.10 (April 2025) - Revised to use annotations for event extraction and
-string-based reference channels with dynamic GUI resizing.
+Version: 1.20 (April 2025) - Revised to use mne.find_events for event extraction
+from a stimulus channel using numerical IDs mapped to labels provided by the user.
+Replaces annotation-based extraction from v1.10.
 
 Key functionalities:
 - Modern GUI using CustomTkinter.
-- Load BioSemi EEG data (.BDF, .set).
-- Process single files or multiple files at once.
-- Preprocessing Steps (adapted from EEGlab workflow)
-    - Import the file using mastoid references (default: EXG1 and EXG2).
-    - Downsample if necessary (default 256 Hz).
-    - Apply standard 10-20 electrode layout
-    - After importing and re-referencing, remove channels EXG1 through EXG8
-    - Bandpass filter (default 0.1–50 Hz).
+- Load EEG data (.BDF, .set).
+- Process single files or batch folders.
+- Preprocessing Steps:
+    - Specify Stimulus Channel Name (default: 'Status').
+    - Initial Bipolar Reference using user-specified channels.
+    - Downsample.
+    - Apply standard_1020 montage.
+    - Drop channels above a specified index (preserving Stim/Status channel).
+    - Bandpass filter.
     - Kurtosis-based channel rejection & interpolation.
-    - Re-reference to the average reference
-- Extract epochs based on textual annotations (e.g., "condition 1", "condition 2", etc.).
+    - Average common reference.
+- Extract epochs based on numerical triggers found via mne.find_events,
+  using a user-provided mapping of Labels to Numerical IDs.
 - Post-processing using FFT, SNR, Z-score, BCA computation.
-- Saves Excel files with separate sheets per metric.
+- Saves Excel files with separate sheets per metric, named by condition label.
 - Background processing with progress updates.
 """
 
@@ -35,6 +38,7 @@ import traceback
 import threading
 import queue
 import gc  # Garbage Collector
+import re # For parsing event map
 
 # Third-Party Libraries:
 import numpy as np
@@ -61,7 +65,7 @@ except ImportError:
 # === End Dependencies ===
 
 # =====================================================
-# Fixed electrode names for 64 electrode biosemi layout
+# Fixed parameters for post-processing
 # =====================================================
 TARGET_FREQUENCIES = np.arange(1.2, 16.8 + 1.2, 1.2)
 DEFAULT_ELECTRODE_NAMES_64 = [
@@ -73,6 +77,7 @@ DEFAULT_ELECTRODE_NAMES_64 = [
     'T8', 'TP8', 'CP6', 'CP4', 'CP2', 'P2', 'P4', 'P6', 'P8', 'P10',
     'PO8', 'PO4', 'O2'
 ]
+DEFAULT_STIM_CHANNEL = 'Status' # Default stimulus channel name
 
 # =====================================================
 # GUI Configuration
@@ -83,43 +88,50 @@ CORNER_RADIUS = 8
 PAD_X = 5
 PAD_Y = 5
 ENTRY_WIDTH = 100
+LABEL_ID_ENTRY_WIDTH = 120
 
 
 class FPVSApp(ctk.CTk):
-    """ Main application class replicating MATLAB FPVS analysis workflow. """
+    """ Main application class replicating MATLAB FPVS analysis workflow using numerical triggers. """
 
     def __init__(self):
         super().__init__()
         today_str = pd.Timestamp.now().strftime('%Y-%m-%d')
-        self.title(f"EEG FPVS Analysis Tool (v1.10 - {today_str})")
-        self.geometry("1000x950")  # initial geometry; will adjust dynamically later
+        # --- Version Update ---
+        self.title(f"EEG FPVS Analysis Tool (v1.20 - {today_str})")
+        self.geometry("1000x950")  # initial geometry
 
         # Data structures
         self.preprocessed_data = {}
-        self.condition_entries = []  # List of strings for condition (e.g., "condition 1")
-        self.current_event_ids_process = []  # Will hold condition strings extracted from GUI
+        # --- Event ID Input Change ---
+        # self.condition_entries = [] # Replaced by event_map_entries
+        self.event_map_entries = [] # List to hold tuples of (label_entry, id_entry, frame, button)
+        self.current_event_map = {} # Will hold {'Label': ID} from GUI during processing
         self.data_paths = []
         self.processing_thread = None
         self.detection_thread = None
         self.gui_queue = queue.Queue()
         self._max_progress = 1
-        self.validated_params = {}  # To store validated parameters
+        self.validated_params = {}
+
+        self.save_preprocessed = tk.BooleanVar(value=False)
 
         self.create_menu()
         self.create_widgets()
-        self.log("Welcome to the EEG FPVS Analysis Tool (Python Version)!")
+        self.log("Welcome to the EEG FPVS Analysis Tool (Numerical Trigger Version)!")
         self.log(f"Appearance Mode: {ctk.get_appearance_mode()}")
 
-        # Dynamically adjust the window size to ensure all widgets (including process button) are visible.
         self.update_idletasks()
         req_width = self.winfo_reqwidth()
         req_height = self.winfo_reqheight()
         self.geometry(f"{req_width}x{req_height}")
 
-        if self.condition_entries:
-            self.condition_entries[0].focus_set()
+        # Focus first event label entry if it exists
+        if self.event_map_entries:
+            self.event_map_entries[0]['label'].focus_set()
 
-    # --- Menu Methods ---
+
+    # --- Menu Methods (unchanged) ---
     def create_menu(self):
         self.menubar = tk.Menu(self)
         self.config(menu=self.menubar)
@@ -144,8 +156,9 @@ class FPVSApp(ctk.CTk):
         ctk.set_appearance_mode(mode)
 
     def show_about_dialog(self):
+         # --- Version Update ---
         messagebox.showinfo("About EEG FPVS Analysis Tool",
-                            f"Version: 1.10 ({pd.Timestamp.now().strftime('%B %Y')})")
+                            f"Version: 1.20 ({pd.Timestamp.now().strftime('%B %Y')})\nUsing numerical triggers via mne.find_events.")
 
     def quit(self):
         if (self.processing_thread and self.processing_thread.is_alive()) or \
@@ -158,31 +171,43 @@ class FPVSApp(ctk.CTk):
             self.destroy()
 
     # --- Validation Methods ---
-    # For numeric entries we still retain these, but for condition and ref channel entries we allow strings.
-    def _validate_numeric_input(self, P):
-        if P == "" or P == "-":
+    def _validate_numeric_input(self, P): # Used for IDs and other params
+        if P == "" or P == "-": # Allow empty or negative sign start
             return True
         try:
-            float(P)
+            float(P) # Check if convertible to float (allows integers too)
             return True
         except ValueError:
-            self.bell()
+            self.bell() # System beep for invalid input
             return False
+
+    def _validate_integer_input(self, P): # Specifically for Event IDs
+        if P == "": # Allow empty
+             return True
+        try:
+             int(P) # Must be an integer
+             return True
+        except ValueError:
+             self.bell()
+             return False
 
     # --- GUI Creation ---
     def create_widgets(self):
         """ Builds and arranges GUI components. """
-        # For condition text fields, no validation command is required
         validate_num_cmd = (self.register(self._validate_numeric_input), '%P')
+        # --- New validator for integer Event IDs ---
+        validate_int_cmd = (self.register(self._validate_integer_input), '%P')
 
         main_frame = ctk.CTkFrame(self, corner_radius=0)
         main_frame.pack(fill="both", expand=True, padx=PAD_X*2, pady=PAD_Y*2)
-        main_frame.grid_rowconfigure(3, weight=1)
+        # --- Adjusted row weights if necessary ---
+        main_frame.grid_rowconfigure(3, weight=1) # Row for event map frame
         main_frame.grid_columnconfigure(0, weight=1)
 
-        # Options Frame inside the GUI
+        # Options Frame (Mostly unchanged)
         self.options_frame = ctk.CTkFrame(main_frame)
         self.options_frame.pack(fill="x", padx=PAD_X, pady=PAD_Y)
+        # ... (Labels, Radiobuttons for Mode/File Type, Select Button - remain the same) ...
         ctk.CTkLabel(
             self.options_frame, text="Processing Options",
             font=ctk.CTkFont(weight="bold")
@@ -222,6 +247,7 @@ class FPVSApp(ctk.CTk):
         self.select_button.grid(row=1, column=3, rowspan=2, padx=PAD_X*2, pady=PAD_Y, sticky="ew")
         self.options_frame.grid_columnconfigure(3, weight=1)
 
+
         # Params Frame
         self.params_frame = ctk.CTkFrame(main_frame)
         self.params_frame.pack(fill="x", padx=PAD_X, pady=PAD_Y)
@@ -230,106 +256,107 @@ class FPVSApp(ctk.CTk):
             font=ctk.CTkFont(weight="bold")
         ).grid(row=0, column=0, columnspan=6, sticky="w", padx=PAD_X, pady=(PAD_Y, PAD_Y*2))
 
+        # Row 1: Filter Frequencies
         ctk.CTkLabel(self.params_frame, text="Low Pass (Hz):").grid(row=1, column=0, sticky="w", padx=PAD_X, pady=PAD_Y)
-        self.low_pass_entry = ctk.CTkEntry(
-            self.params_frame, width=ENTRY_WIDTH, validate='key',
-            validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS
-        )
+        self.low_pass_entry = ctk.CTkEntry(self.params_frame, width=ENTRY_WIDTH, validate='key', validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS)
         self.low_pass_entry.insert(0, "0.1")
         self.low_pass_entry.grid(row=1, column=1, padx=PAD_X, pady=PAD_Y)
-
         ctk.CTkLabel(self.params_frame, text="High Pass (Hz):").grid(row=1, column=2, sticky="w", padx=PAD_X, pady=PAD_Y)
-        self.high_pass_entry = ctk.CTkEntry(
-            self.params_frame, width=ENTRY_WIDTH, validate='key',
-            validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS
-        )
+        self.high_pass_entry = ctk.CTkEntry(self.params_frame, width=ENTRY_WIDTH, validate='key', validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS)
         self.high_pass_entry.insert(0, "50")
         self.high_pass_entry.grid(row=1, column=3, padx=PAD_X, pady=PAD_Y)
 
+        # Row 2: Downsample & Epoch Times
         ctk.CTkLabel(self.params_frame, text="Downsample (Hz):").grid(row=2, column=0, sticky="w", padx=PAD_X, pady=PAD_Y)
-        self.downsample_entry = ctk.CTkEntry(
-            self.params_frame, width=ENTRY_WIDTH, validate='key',
-            validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS
-        )
+        self.downsample_entry = ctk.CTkEntry(self.params_frame, width=ENTRY_WIDTH, validate='key', validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS)
         self.downsample_entry.insert(0, "256")
         self.downsample_entry.grid(row=2, column=1, padx=PAD_X, pady=PAD_Y)
-
         ctk.CTkLabel(self.params_frame, text="Epoch Start (s):").grid(row=2, column=2, sticky="w", padx=PAD_X, pady=PAD_Y)
-        self.epoch_start_entry = ctk.CTkEntry(
-            self.params_frame, width=ENTRY_WIDTH, validate='key',
-            validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS
-        )
+        self.epoch_start_entry = ctk.CTkEntry(self.params_frame, width=ENTRY_WIDTH, validate='key', validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS)
         self.epoch_start_entry.insert(0, "-1")
         self.epoch_start_entry.grid(row=2, column=3, padx=PAD_X, pady=PAD_Y)
-
         ctk.CTkLabel(self.params_frame, text="Epoch End (s):").grid(row=2, column=4, sticky="w", padx=PAD_X, pady=PAD_Y)
-        self.epoch_end_entry = ctk.CTkEntry(
-            self.params_frame, width=ENTRY_WIDTH+20, validate='key',
-            validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS
-        )
+        self.epoch_end_entry = ctk.CTkEntry(self.params_frame, width=ENTRY_WIDTH, validate='key', validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS)
         self.epoch_end_entry.insert(0, "125")
-        self.epoch_end_entry.grid(row=2, column=5, padx=PAD_X, pady=PAD_Y)  # Default 125s
+        self.epoch_end_entry.grid(row=2, column=5, padx=PAD_X, pady=PAD_Y)
 
-        ctk.CTkLabel(self.params_frame, text="Rejection Z-Threshold:").grid(row=3, column=0, sticky="w", padx=PAD_X, pady=PAD_Y)
-        self.reject_thresh_entry = ctk.CTkEntry(
-            self.params_frame, width=ENTRY_WIDTH, validate='key',
-            validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS
-        )
+        # Row 3: Rejection & Save Option
+        ctk.CTkLabel(self.params_frame, text="Rejection Z-Thresh:").grid(row=3, column=0, sticky="w", padx=PAD_X, pady=PAD_Y)
+        self.reject_thresh_entry = ctk.CTkEntry(self.params_frame, width=ENTRY_WIDTH, validate='key', validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS)
         self.reject_thresh_entry.insert(0, "5")
         self.reject_thresh_entry.grid(row=3, column=1, padx=PAD_X, pady=PAD_Y)
+        self.save_preprocessed_checkbox = ctk.CTkCheckBox(self.params_frame, text="Save Preprocessed (.fif)", variable=self.save_preprocessed, onvalue=True, offvalue=False, corner_radius=CORNER_RADIUS)
+        self.save_preprocessed_checkbox.grid(row=3, column=2, columnspan=2, padx=PAD_X, pady=PAD_Y, sticky="w")
 
-        # Reference Channels now as strings; defaults are "EXG1" and "EXG2"
+        # Row 4: Reference Channels
         ctk.CTkLabel(self.params_frame, text="Reference Channel 1:").grid(row=4, column=0, sticky="w", padx=PAD_X, pady=PAD_Y)
-        self.ref_channel1_entry = ctk.CTkEntry(
-            self.params_frame, width=ENTRY_WIDTH, corner_radius=CORNER_RADIUS
-        )
+        self.ref_channel1_entry = ctk.CTkEntry(self.params_frame, width=ENTRY_WIDTH, corner_radius=CORNER_RADIUS)
         self.ref_channel1_entry.insert(0, "EXG1")
         self.ref_channel1_entry.grid(row=4, column=1, padx=PAD_X, pady=PAD_Y)
-
         ctk.CTkLabel(self.params_frame, text="Reference Channel 2:").grid(row=4, column=2, sticky="w", padx=PAD_X, pady=PAD_Y)
-        self.ref_channel2_entry = ctk.CTkEntry(
-            self.params_frame, width=ENTRY_WIDTH, corner_radius=CORNER_RADIUS
-        )
+        self.ref_channel2_entry = ctk.CTkEntry(self.params_frame, width=ENTRY_WIDTH, corner_radius=CORNER_RADIUS)
         self.ref_channel2_entry.insert(0, "EXG2")
         self.ref_channel2_entry.grid(row=4, column=3, padx=PAD_X, pady=PAD_Y)
 
-        ctk.CTkLabel(self.params_frame, text="Max EEG Channels Keep:").grid(row=4, column=4, sticky="w", padx=PAD_X, pady=PAD_Y)
-        self.max_idx_keep_entry = ctk.CTkEntry(
-            self.params_frame, width=ENTRY_WIDTH, validate='key',
-            validatecommand=validate_num_cmd, corner_radius=CORNER_RADIUS
-        )
+        # Row 5: Max Channels & Stim Channel
+        ctk.CTkLabel(self.params_frame, text="Max EEG Channels Keep:").grid(row=5, column=0, sticky="w", padx=PAD_X, pady=PAD_Y)
+        self.max_idx_keep_entry = ctk.CTkEntry(self.params_frame, width=ENTRY_WIDTH, validate='key', validatecommand=validate_int_cmd, corner_radius=CORNER_RADIUS) # Should be integer
         self.max_idx_keep_entry.insert(0, "64")
-        self.max_idx_keep_entry.grid(row=4, column=5, padx=PAD_X, pady=PAD_Y)
+        self.max_idx_keep_entry.grid(row=5, column=1, padx=PAD_X, pady=PAD_Y)
+        # --- New Stimulus Channel Entry ---
+        ctk.CTkLabel(self.params_frame, text="Stimulus Channel Name:").grid(row=5, column=2, sticky="w", padx=PAD_X, pady=PAD_Y)
+        self.stim_channel_entry = ctk.CTkEntry(self.params_frame, width=ENTRY_WIDTH, corner_radius=CORNER_RADIUS)
+        self.stim_channel_entry.insert(0, DEFAULT_STIM_CHANNEL) # Default 'Status'
+        self.stim_channel_entry.grid(row=5, column=3, padx=PAD_X, pady=PAD_Y)
 
-        # Event IDs Frame – now these are free-text fields (no numeric validation)
-        conditions_frame_outer = ctk.CTkFrame(main_frame)
-        conditions_frame_outer.pack(fill="both", expand=True, padx=PAD_X, pady=PAD_Y)
+
+        # --- Event ID Frame - Changed for Label:ID Mapping ---
+        event_map_frame_outer = ctk.CTkFrame(main_frame)
+        event_map_frame_outer.pack(fill="both", expand=True, padx=PAD_X, pady=PAD_Y)
         ctk.CTkLabel(
-            conditions_frame_outer, text="Event IDs (Conditions) to Extract",
+            event_map_frame_outer, text="Event Label to Numerical ID Mapping",
             font=ctk.CTkFont(weight="bold")
         ).pack(anchor="w", padx=PAD_X, pady=(PAD_Y, 0))
-        self.conditions_scroll_frame = ctk.CTkScrollableFrame(conditions_frame_outer, label_text="")
-        self.conditions_scroll_frame.pack(fill="both", expand=True, padx=PAD_X, pady=(0, PAD_Y))
-        self.conditions_scroll_frame.grid_columnconfigure(0, weight=1)
-        self.condition_entries = []
-        self.add_event_id_entry()  # Pre-populate a single field
 
-        condition_button_frame = ctk.CTkFrame(conditions_frame_outer, fg_color="transparent")
-        condition_button_frame.pack(fill="x", pady=(0, PAD_Y), padx=PAD_X)
+        # Add headers for the columns
+        header_frame = ctk.CTkFrame(event_map_frame_outer, fg_color="transparent")
+        header_frame.pack(fill="x", padx=PAD_X, pady=(2, 0))
+        ctk.CTkLabel(header_frame, text="Condition Label (for Output)", width=LABEL_ID_ENTRY_WIDTH*2, anchor="w").pack(side="left", padx=(0, PAD_X))
+        ctk.CTkLabel(header_frame, text="Numerical ID (Trigger Code)", width=LABEL_ID_ENTRY_WIDTH, anchor="w").pack(side="left", padx=(PAD_X, PAD_X))
+        # Placeholder on the right to align with remove button
+        ctk.CTkLabel(header_frame, text="", width=28).pack(side="right", padx=(PAD_X, 0))
+
+
+        self.event_map_scroll_frame = ctk.CTkScrollableFrame(event_map_frame_outer, label_text="")
+        self.event_map_scroll_frame.pack(fill="both", expand=True, padx=PAD_X, pady=(0, PAD_Y))
+        self.event_map_scroll_frame.grid_columnconfigure(0, weight=1) # Make label entry expand
+        self.event_map_scroll_frame.grid_columnconfigure(1, weight=0) # ID entry fixed width
+        self.event_map_scroll_frame.grid_columnconfigure(2, weight=0) # Button fixed width
+
+        self.event_map_entries = [] # Reset list
+        self.add_event_map_entry()  # Pre-populate one row
+
+        # Buttons below the scrollable frame
+        event_map_button_frame = ctk.CTkFrame(event_map_frame_outer, fg_color="transparent")
+        event_map_button_frame.pack(fill="x", pady=(0, PAD_Y), padx=PAD_X)
+        # --- Changed Detect Button Text ---
         self.detect_button = ctk.CTkButton(
-            condition_button_frame, text="Detect Event IDs",
-            command=self.detect_and_populate_event_ids, corner_radius=CORNER_RADIUS
+            event_map_button_frame, text="Detect Numerical IDs",
+            command=self.detect_and_show_event_ids, corner_radius=CORNER_RADIUS
         )
         self.detect_button.pack(side="left", padx=(0, PAD_X))
-        self.add_cond_button = ctk.CTkButton(
-            condition_button_frame, text="Add Event ID Field",
-            command=self.add_event_id_entry, corner_radius=CORNER_RADIUS
+        self.add_map_button = ctk.CTkButton(
+            event_map_button_frame, text="Add Label:ID Row",
+            command=self.add_event_map_entry, corner_radius=CORNER_RADIUS
         )
-        self.add_cond_button.pack(side="left")
+        self.add_map_button.pack(side="left")
+        # --- End Event ID Frame Change ---
 
-        # Save Location Frame
+
+        # Save Location Frame (Unchanged)
         self.save_frame = ctk.CTkFrame(main_frame)
         self.save_frame.pack(fill="x", padx=PAD_X, pady=PAD_Y)
+        # ... (Label, Button, Entry - remain the same) ...
         ctk.CTkLabel(
             self.save_frame, text="Excel Output Save Location",
             font=ctk.CTkFont(weight="bold")
@@ -347,16 +374,19 @@ class FPVSApp(ctk.CTk):
         self.save_folder_display.grid(row=1, column=1, sticky="ew", padx=PAD_X, pady=PAD_Y)
         self.save_frame.grid_columnconfigure(1, weight=1)
 
-        # Bottom Controls Frame – Process button should now be visible
+
+        # Bottom Controls Frame (Unchanged layout)
         bottom_controls_frame = ctk.CTkFrame(main_frame)
-        bottom_controls_frame.pack(fill="x", side="bottom", padx=PAD_X, pady=(PAD_Y, 0))
+        bottom_controls_frame.pack(fill="both", expand=True, side="bottom", padx=PAD_X, pady=(PAD_Y, 0))
+        # ... (Log Frame, Progress Bar, Start Button - remain the same) ...
         log_frame_outer = ctk.CTkFrame(bottom_controls_frame)
         log_frame_outer.pack(fill="both", expand=True, padx=0, pady=(0, PAD_Y))
         ctk.CTkLabel(log_frame_outer, text="Log", font=ctk.CTkFont(weight="bold")).pack(anchor="w", padx=PAD_X, pady=(PAD_Y, 0))
         self.log_text = ctk.CTkTextbox(log_frame_outer, height=150, wrap="word", state="disabled", corner_radius=CORNER_RADIUS)
         self.log_text.pack(fill="both", expand=True, padx=PAD_X, pady=PAD_Y)
+
         progress_start_frame = ctk.CTkFrame(bottom_controls_frame, fg_color="transparent")
-        progress_start_frame.pack(fill="x", padx=0, pady=PAD_Y)
+        progress_start_frame.pack(fill="x", side="bottom", padx=0, pady=PAD_Y)
         progress_start_frame.grid_columnconfigure(0, weight=1)
         self.progress_bar = ctk.CTkProgressBar(progress_start_frame, orientation="horizontal", height=20)
         self.progress_bar.grid(row=0, column=0, padx=(0, PAD_X), pady=PAD_Y, sticky="ew")
@@ -366,37 +396,104 @@ class FPVSApp(ctk.CTk):
             corner_radius=CORNER_RADIUS, height=30, font=ctk.CTkFont(weight="bold")
         )
         self.start_button.grid(row=0, column=1, padx=(PAD_X, 0), pady=PAD_Y)
+
         self.update_select_button_text()
 
+
     # --- GUI Update/Action Methods ---
-    def add_event_id_entry(self, event=None):
-        entry_frame = ctk.CTkFrame(self.conditions_scroll_frame, fg_color="transparent")
+
+    # --- Methods to add/remove Label:ID rows ---
+    def add_event_map_entry(self, event=None):
+        """Adds a new row with Condition Label and Numerical ID entry fields."""
+        # Validator for integer IDs
+        validate_int_cmd = (self.register(self._validate_integer_input), '%P')
+
+        # Container frame for one row
+        entry_frame = ctk.CTkFrame(self.event_map_scroll_frame, fg_color="transparent")
         entry_frame.pack(fill="x", pady=1, padx=1)
-        entry = ctk.CTkEntry(entry_frame, width=100, corner_radius=CORNER_RADIUS)
-        entry.pack(side="left", fill="x", expand=True, padx=(0, PAD_X))
-        entry.bind("<Return>", self.add_event_id_entry)
-        entry.bind("<KP_Enter>", self.add_event_id_entry)
+
+        # Condition Label entry
+        label_entry = ctk.CTkEntry(
+            entry_frame,
+            placeholder_text="Condition Label",
+            width=LABEL_ID_ENTRY_WIDTH*2,
+            corner_radius=CORNER_RADIUS
+        )
+        label_entry.pack(side="left", fill="x", expand=True, padx=(0, PAD_X))
+        # Bind Enter on the internal tk.Entry
+        label_entry._entry.bind("<Return>",   self._add_row_and_focus_label)
+        label_entry._entry.bind("<KP_Enter>", self._add_row_and_focus_label)
+
+        # Numerical ID entry
+        id_entry = ctk.CTkEntry(
+            entry_frame,
+            placeholder_text="Numerical ID",
+            width=LABEL_ID_ENTRY_WIDTH,
+            validate='key',
+            validatecommand=validate_int_cmd,
+            corner_radius=CORNER_RADIUS
+        )
+        id_entry.pack(side="left", padx=(0, PAD_X))
+        # Bind Enter on the internal tk.Entry
+        id_entry._entry.bind("<Return>",   self._add_row_and_focus_label)
+        id_entry._entry.bind("<KP_Enter>", self._add_row_and_focus_label)
+
+        # Remove‑row button
         remove_btn = ctk.CTkButton(
-            entry_frame, text="X", width=28, height=28, corner_radius=CORNER_RADIUS,
-            command=lambda ef=entry_frame, e=entry: self.remove_event_id_entry(ef, e)
+            entry_frame,
+            text="X",
+            width=28,
+            height=28,
+            corner_radius=CORNER_RADIUS,
+            command=lambda ef=entry_frame: self.remove_event_map_entry(ef)
         )
         remove_btn.pack(side="right")
-        self.condition_entries.append(entry)
-        if event is None and entry.winfo_exists():
-            entry.focus_set()
 
-    def remove_event_id_entry(self, entry_frame, entry_widget):
+        # Track this row’s widgets
+        self.event_map_entries.append({
+            'frame': entry_frame,
+            'label': label_entry,
+            'id':    id_entry,
+            'button': remove_btn
+        })
+
+        # If this was user‑initiated (not the initial call), focus the new label
+        if event is None and label_entry.winfo_exists():
+            label_entry.focus_set()
+
+
+    def remove_event_map_entry(self, entry_frame_to_remove):
+        """Removes the specified Label:ID row."""
         try:
-            if entry_frame.winfo_exists():
-                entry_frame.destroy()
-            if entry_widget in self.condition_entries:
-                self.condition_entries.remove(entry_widget)
-            if not self.condition_entries:
-                self.add_event_id_entry()
+            # Find the corresponding entry in the list
+            entry_to_remove = None
+            for entry_data in self.event_map_entries:
+                if entry_data['frame'] == entry_frame_to_remove:
+                    entry_to_remove = entry_data
+                    break
+
+            if entry_to_remove:
+                 # Check if widgets exist before destroying
+                 if entry_to_remove['frame'].winfo_exists():
+                     entry_to_remove['frame'].destroy()
+                 self.event_map_entries.remove(entry_to_remove)
+
+                 # Ensure there's always at least one entry row
+                 if not self.event_map_entries:
+                     self.add_event_map_entry()
+                 # Optional: set focus to the last label entry if available
+                 elif self.event_map_entries and self.event_map_entries[-1]['label'].winfo_exists():
+                      self.event_map_entries[-1]['label'].focus_set()
+            else:
+                 self.log("Warning: Could not find the specified event map row to remove.")
+
         except Exception as e:
-            self.log(f"Error removing Event ID field: {e}")
+            self.log(f"Error removing Event Map row: {e}")
+    # --- End Label:ID row methods ---
+
 
     def select_save_folder(self):
+        # (Unchanged)
         folder = filedialog.askdirectory(title="Select Parent Folder for Excel Output")
         if folder:
             self.save_folder_path.set(folder)
@@ -405,12 +502,14 @@ class FPVSApp(ctk.CTk):
             self.log("Save folder selection cancelled.")
 
     def update_select_button_text(self):
+        # (Unchanged)
         mode = self.file_mode.get()
         text = "Select EEG File..." if mode == "Single" else "Select Folder..."
         if hasattr(self, 'select_button') and self.select_button:
-            self.select_button_text.set(text)
+             self.select_button_text.set(text)
 
     def select_data_source(self):
+        # (Unchanged - still selects BDF/SET files)
         self.data_paths = []
         file_ext = "*" + self.file_type.get().lower()
         file_type_desc = self.file_type.get().upper()
@@ -421,6 +520,7 @@ class FPVSApp(ctk.CTk):
                 other_desc = ".SET" if file_type_desc == ".BDF" else ".BDF"
                 ftypes.append((f"{other_desc} files", other_ext))
                 ftypes.append(("All files", "*.*"))
+
                 file_path = filedialog.askopenfilename(title="Select EEG File", filetypes=ftypes)
                 if file_path:
                     selected_ext = os.path.splitext(file_path)[1].lower()
@@ -431,7 +531,7 @@ class FPVSApp(ctk.CTk):
                     self.log(f"Selected file: {os.path.basename(file_path)}")
                 else:
                     self.log("No file selected.")
-            else:  # Batch mode
+            else: # Batch mode
                 folder = filedialog.askdirectory(title=f"Select Folder with {file_type_desc} Files")
                 if folder:
                     search_path = os.path.join(folder, file_ext)
@@ -447,10 +547,12 @@ class FPVSApp(ctk.CTk):
         except Exception as e:
             self.log(f"Error selecting data: {e}")
             messagebox.showerror("Selection Error", f"Error during selection:\n{e}")
+
         self._max_progress = len(self.data_paths) if self.data_paths else 1
         self.progress_bar.set(0)
 
-    # --- Logging ---
+
+    # --- Logging (Unchanged) ---
     def log(self, message):
         if hasattr(self, 'log_text') and self.log_text:
             try:
@@ -467,60 +569,96 @@ class FPVSApp(ctk.CTk):
                         self.log_text.configure(state="disabled")
 
                 if ct != threading.main_thread():
-                    if hasattr(self, 'after') and self.winfo_exists():
-                        self.after(0, update_gui)
-                    print(log_msg, end='')
+                     if hasattr(self, 'after') and self.winfo_exists():
+                         self.after(0, update_gui)
+                     print(log_msg, end='')
                 else:
                     update_gui()
                     self.update_idletasks()
+
             except Exception as e:
                 print(f"--- GUI Log Error: {e} ---\n{pd.Timestamp.now().strftime('%H:%M:%S.%f')[:-3]} Log Console: {message}")
 
-    # --- Event ID Detection (Background Thread) ---
-    def detect_and_populate_event_ids(self):
-        self.log("Detect Event IDs button clicked...")
+
+    # --- Event ID Detection (Changed for find_events) ---
+    def detect_and_show_event_ids(self):
+        # --- Method Renamed and Logic Changed ---
+        self.log("Detect Numerical IDs button clicked...")
         if self.detection_thread and self.detection_thread.is_alive():
             messagebox.showwarning("Busy", "Event detection is already running.")
             return
+
         if not self.data_paths:
             messagebox.showerror("No Data Selected", "Please select a data file or folder first.")
             self.log("Detection failed: No data selected.")
             return
+
+        # Get stim channel name from GUI (use default if empty)
+        stim_channel_name = self.stim_channel_entry.get().strip()
+        if not stim_channel_name:
+             stim_channel_name = DEFAULT_STIM_CHANNEL
+             self.log(f"Stim channel entry empty, using default: {DEFAULT_STIM_CHANNEL}")
+        else:
+             self.log(f"Using stim channel from entry: {stim_channel_name}")
+
+
         representative_file = self.data_paths[0]
-        self.log(f"Starting background detection for: {os.path.basename(representative_file)}")
+        self.log(f"Starting background detection using mne.find_events for: {os.path.basename(representative_file)}")
         self._disable_controls(enable_process_buttons=None)
+
         try:
             self.detection_thread = threading.Thread(
                 target=self._detection_thread_func,
-                args=(representative_file, self.gui_queue),
+                # --- Pass stim channel name ---
+                args=(representative_file, stim_channel_name, self.gui_queue),
                 daemon=True
             )
             self.detection_thread.start()
             self.after(100, self._periodic_detection_queue_check)
         except Exception as start_err:
-            self.log(f"Error starting detection thread: {start_err}")
-            messagebox.showerror("Thread Error", f"Could not start detection thread:\n{start_err}")
-            self._enable_controls(enable_process_buttons=None)
+             self.log(f"Error starting detection thread: {start_err}")
+             messagebox.showerror("Thread Error", f"Could not start detection thread:\n{start_err}")
+             self._enable_controls(enable_process_buttons=None)
 
-    def _detection_thread_func(self, file_path, gui_queue):
-        """ Background task: load file and extract events from annotations. """
+
+    def _detection_thread_func(self, file_path, stim_channel_name, gui_queue):
+        # --- Method Changed to use find_events ---
+        """ Background task: load file and find numerical event IDs. """
         raw = None
         gc.collect()
         try:
+            # Load the file (don't necessarily need stim_channel here, find_events takes it)
             raw = self.load_eeg_file(file_path)
             if raw is None:
                 raise ValueError("File loading failed (check log).")
-            # Use annotations for event extraction
-            events, event_dict = mne.events_from_annotations(raw)
+
+            gui_queue.put({'type': 'log', 'message': f"Searching for numerical triggers on channel '{stim_channel_name}'..."})
+            # --- Use mne.find_events ---
+            try:
+                 # consecutive=True helps merge stepped triggers if needed
+                 events = mne.find_events(raw, stim_channel=stim_channel_name, consecutive=True, verbose=False)
+            except ValueError as find_err:
+                 if "not found" in str(find_err):
+                      gui_queue.put({'type': 'log', f'message': f"Error: Stim channel '{stim_channel_name}' not found in {os.path.basename(file_path)}."})
+                      gui_queue.put({'type': 'detection_error', 'message': f"Stim channel '{stim_channel_name}' not found."})
+                      return # Exit thread
+                 else:
+                      raise find_err # Re-raise other find_events errors
+
             if events is None or len(events) == 0:
-                gui_queue.put({'type': 'log', 'message': "Info: No events found via annotations."})
-                detected_labels = []
+                gui_queue.put({'type': 'log', 'message': f"Info: No events found using mne.find_events on channel '{stim_channel_name}'."})
+                detected_ids = []
             else:
-                gui_queue.put({'type': 'log', 'message': f"Found {len(events)} events. Event types: {list(event_dict.keys())}"})
-                detected_labels = list(event_dict.keys())
-            gui_queue.put({'type': 'detection_result', 'ids': detected_labels})
+                # Extract the unique numerical IDs from the third column of the events array
+                unique_numeric_ids = sorted(list(np.unique(events[:, 2])))
+                gui_queue.put({'type': 'log', 'message': f"Found {len(events)} event triggers. Unique numerical IDs: {unique_numeric_ids}"})
+                detected_ids = unique_numeric_ids
+
+            # Send numerical IDs back
+            gui_queue.put({'type': 'detection_result', 'ids': detected_ids})
+
         except Exception as e:
-            error_msg = f"Error during event detection: {e}"
+            error_msg = f"Error during event ID detection: {e}"
             gui_queue.put({'type': 'log', 'message': f"!!! {error_msg}\n{traceback.format_exc()}"})
             gui_queue.put({'type': 'detection_error', 'message': error_msg})
         finally:
@@ -529,42 +667,37 @@ class FPVSApp(ctk.CTk):
                 gc.collect()
             gui_queue.put({'type': 'detection_done'})
 
+
     def _periodic_detection_queue_check(self):
+        # --- Method Changed: Only displays detected IDs ---
         """ Checks queue for results from the detection thread. """
         detection_finished = False
         try:
             while True:
                 message = self.gui_queue.get_nowait()
                 msg_type = message.get('type')
+
                 if msg_type == 'log':
                     self.log(message.get('message', ''))
                 elif msg_type == 'detection_result':
                     detected_ids = message.get('ids', [])
-                    self._clear_and_reset_event_id_fields()
                     if detected_ids:
-                        self.log("Populating fields with detected IDs...")
-                        for label in detected_ids:
-                            self.add_event_id_entry()
-                            self.condition_entries[-1].delete(0, tk.END)
-                            self.condition_entries[-1].insert(0, label)
-                        messagebox.showinfo("Event IDs Detected",
-                                            f"Populated list with {len(detected_ids)} unique Event ID(s).\nPlease review.")
-                        if self.condition_entries and self.condition_entries[0].winfo_exists():
-                            self.condition_entries[0].focus_set()
+                        # --- Just show the IDs found ---
+                        id_string = ", ".join(map(str, detected_ids))
+                        self.log(f"Detected numerical event IDs: {id_string}")
+                        messagebox.showinfo("Numerical IDs Detected",
+                                            f"Found the following unique numerical event IDs in the file:\n\n{id_string}\n\nPlease enter the desired Label:ID pairs manually below.")
                     else:
-                        messagebox.showinfo("No Events Found", "No event triggers found.\nPlease enter IDs manually.")
+                        messagebox.showinfo("No Numerical IDs Found", "No numerical event triggers found using mne.find_events.\nPlease check the Stimulus Channel Name or the file content.")
                     detection_finished = True
                 elif msg_type == 'detection_error':
                     error_msg = message.get('message', 'Unknown error.')
-                    if "'Status' channel not found" in error_msg:
-                        messagebox.showwarning("Channel Not Found", "'Status' channel not found.\nEnter IDs manually.")
-                    else:
-                        messagebox.showerror("Detection Error", error_msg)
-                    self._clear_and_reset_event_id_fields()
+                    messagebox.showerror("Detection Error", error_msg)
                     detection_finished = True
                 elif msg_type == 'detection_done':
-                    self.log("Detection thread finished.")
+                    self.log("Numerical ID detection thread finished.")
                     detection_finished = True
+
         except queue.Empty:
             pass
         except Exception as e:
@@ -576,43 +709,44 @@ class FPVSApp(ctk.CTk):
             self._enable_controls(enable_process_buttons=None)
             self.detection_thread = None
             gc.collect()
-            self.log("Detection process finished.")
+            self.log("Numerical ID detection process finished.")
         elif self.detection_thread and self.detection_thread.is_alive():
             self.after(100, self._periodic_detection_queue_check)
         else:
-            self.log("Warn: Detection thread ended unexpectedly.")
-            self._enable_controls(enable_process_buttons=None)
-            self.detection_thread = None
+             self.log("Warn: Detection thread ended unexpectedly.")
+             self._enable_controls(enable_process_buttons=None)
+             self.detection_thread = None
 
-    def _clear_and_reset_event_id_fields(self):
-        self.log("Clearing Event ID fields...")
-        try:
-            for widget in self.conditions_scroll_frame.winfo_children():
-                widget.destroy()
-            self.condition_entries = []
-            self.add_event_id_entry()
-        except Exception as e:
-            self.log(f"Error resetting Event ID fields: {e}")
+    # --- Removed _clear_and_reset_event_id_fields ---
+    # Not needed as we don't auto-populate the Label:ID map anymore.
+
 
     # --- Core Processing Control ---
     def start_processing(self):
+        # (Checks remain the same)
         if self.processing_thread and self.processing_thread.is_alive():
             messagebox.showwarning("Busy", "Processing is already running.")
             return
         if self.detection_thread and self.detection_thread.is_alive():
-            messagebox.showwarning("Busy", "Event detection is running.")
+            messagebox.showwarning("Busy", "Event detection is running. Please wait.")
             return
+
         self.log("=" * 50)
         self.log("START PROCESSING Initiated...")
+
+        # --- Validation updated for event map ---
         if not self._validate_inputs():
             return
+
         self.preprocessed_data = {}
         self.progress_bar.set(0)
         self._max_progress = len(self.data_paths)
+
         self._disable_controls(enable_process_buttons=False)
+
         self.log("Starting background processing thread...")
-        thread_args = (list(self.data_paths), self.validated_params.copy(),
-                       list(self.current_event_ids_process), self.gui_queue)
+        # --- Pass validated params including event_id_map ---
+        thread_args = (list(self.data_paths), self.validated_params.copy(), self.gui_queue)
         self.processing_thread = threading.Thread(
             target=self._processing_thread_func,
             args=thread_args,
@@ -621,36 +755,36 @@ class FPVSApp(ctk.CTk):
         self.processing_thread.start()
         self.after(100, self._periodic_queue_check)
 
-    # --- Input Validation ---
+
+    # --- Input Validation (Updated for Event Map & Stim Channel) ---
     def _validate_inputs(self):
-        """ Validates file selection, folder, and parameters. """
+        """ Validates file selection, folder, parameters, and event map. """
+        # 1. Check Data Paths (Unchanged)
         if not self.data_paths:
             self.log("V-Error: No data.")
             messagebox.showerror("Input Error", "No data selected.")
             return False
+
+        # 2. Check Save Folder (Unchanged)
         save_folder = self.save_folder_path.get()
         if not save_folder:
-            self.log("V-Error: No save folder.")
-            messagebox.showerror("Input Error", "No output folder selected.")
-            return False
+             self.log("V-Error: No save folder.")
+             messagebox.showerror("Input Error", "No output folder selected.")
+             return False
         if not os.path.isdir(save_folder):
-            try:
-                os.makedirs(save_folder, exist_ok=True)
-                self.log(f"Created save folder: {save_folder}")
-            except Exception as e:
-                self.log(f"V-Error: Cannot create folder {save_folder}: {e}")
-                messagebox.showerror("Input Error", f"Cannot create folder:\n{save_folder}\n{e}")
-                return False
+             try:
+                 os.makedirs(save_folder, exist_ok=True)
+                 self.log(f"Created save folder: {save_folder}")
+             except Exception as e:
+                 self.log(f"V-Error: Cannot create folder {save_folder}: {e}")
+                 messagebox.showerror("Input Error", f"Cannot create folder:\n{save_folder}\n{e}")
+                 return False
 
+        # 3. Validate Parameters
         params = {}
         try:
-            def get_float(e):
-                s = e.get().strip()
-                return float(s) if s else None
-
-            def get_int(e):
-                s = e.get().strip()
-                return int(s) if s else None
+            def get_float(e): return float(e.get().strip()) if e.get().strip() else None
+            def get_int(e): return int(e.get().strip()) if e.get().strip() else None
 
             params['low_pass'] = get_float(self.low_pass_entry)
             assert params['low_pass'] is None or params['low_pass'] >= 0, "Low Pass >= 0"
@@ -665,35 +799,113 @@ class FPVSApp(ctk.CTk):
             assert params['epoch_start'] < params['epoch_end'], "Epoch Start < End"
             params['reject_thresh'] = get_float(self.reject_thresh_entry)
             assert params['reject_thresh'] is None or params['reject_thresh'] > 0, "Reject Z > 0"
-            # Read reference channels as strings
-            ref1 = self.ref_channel1_entry.get().strip()
-            ref2 = self.ref_channel2_entry.get().strip()
-            params['ref_channel1'] = ref1
-            params['ref_channel2'] = ref2
+            params['ref_channel1'] = self.ref_channel1_entry.get().strip()
+            params['ref_channel2'] = self.ref_channel2_entry.get().strip()
             params['max_idx_keep'] = get_int(self.max_idx_keep_entry)
             assert params['max_idx_keep'] is None or params['max_idx_keep'] > 0, "Max Keep Idx > 0"
             if (params['low_pass'] is not None) and (params['high_pass'] is not None):
-                assert params['low_pass'] < params['high_pass'], "Low Pass < High Pass"
+                 assert params['low_pass'] < params['high_pass'], "Low Pass < High Pass"
+
+            # --- Get Stim Channel Name ---
+            stim_ch = self.stim_channel_entry.get().strip()
+            if not stim_ch:
+                self.log("Stim Channel Name empty, using default: " + DEFAULT_STIM_CHANNEL)
+                params['stim_channel'] = DEFAULT_STIM_CHANNEL
+            else:
+                params['stim_channel'] = stim_ch
+
             params['save_preprocessed'] = self.save_preprocessed.get()
-            self.validated_params = params
+
+        except AssertionError as e:
+             self.log(f"V-Error: Invalid parameter: {e}")
+             messagebox.showerror("Parameter Error", f"Invalid parameter value:\n{e}")
+             return False
+        except ValueError as e:
+             self.log(f"V-Error: Non-numeric parameter: {e}")
+             messagebox.showerror("Parameter Error", f"Invalid numeric value entered.\nPlease check parameters.")
+             return False
         except Exception as e:
-            self.log(f"V-Error: Invalid parameter: {e}")
-            messagebox.showerror("Parameter Error", f"Invalid parameter value:\n{e}")
+             self.log(f"V-Error: Unexpected param validation: {e}")
+             messagebox.showerror("Parameter Error", f"Unexpected error validating parameters:\n{e}")
+             return False
+
+        # --- 4. Validate Event Label:ID Map ---
+        event_map = {}
+        try:
+            unique_labels = set()
+            unique_ids = set()
+            for entry_data in self.event_map_entries:
+                 label = entry_data['label'].get().strip()
+                 id_str = entry_data['id'].get().strip()
+
+                 # Skip empty rows silently
+                 if not label and not id_str:
+                      continue
+
+                 # Validate row completeness
+                 if not label:
+                      messagebox.showerror("Event Map Error", "Found a row with a Numerical ID but no Condition Label.")
+                      entry_data['label'].focus_set()
+                      return False
+                 if not id_str:
+                      messagebox.showerror("Event Map Error", f"Condition Label '{label}' has no Numerical ID specified.")
+                      entry_data['id'].focus_set()
+                      return False
+
+                 # Validate Label uniqueness
+                 if label in unique_labels:
+                      messagebox.showerror("Event Map Error", f"Duplicate Condition Label found: '{label}'. Labels must be unique.")
+                      entry_data['label'].focus_set()
+                      return False
+                 unique_labels.add(label)
+
+                 # Validate ID is integer and unique (optional check for unique IDs, depends on paradigm)
+                 try:
+                      num_id = int(id_str)
+                      # Example: check if ID is already used - uncomment if IDs must be unique
+                      # if num_id in unique_ids:
+                      #     messagebox.showerror("Event Map Error", f"Duplicate Numerical ID found: {num_id}. IDs might need to be unique depending on analysis.")
+                      #     entry_data['id'].focus_set()
+                      #     return False
+                      unique_ids.add(num_id)
+                 except ValueError:
+                      # This should be caught by validate_int_cmd, but double-check
+                      messagebox.showerror("Event Map Error", f"Invalid Numerical ID for label '{label}': '{id_str}'. Must be an integer.")
+                      entry_data['id'].focus_set()
+                      return False
+
+                 event_map[label] = num_id
+
+            if not event_map:
+                self.log("V-Error: No Event Map entries.")
+                messagebox.showerror("Event Map Error", "Please enter at least one Condition Label and its corresponding Numerical ID.")
+                # Focus the first empty field if available
+                if self.event_map_entries:
+                     if not self.event_map_entries[0]['label'].get().strip():
+                          self.event_map_entries[0]['label'].focus_set()
+                     elif not self.event_map_entries[0]['id'].get().strip():
+                          self.event_map_entries[0]['id'].focus_set()
+                return False
+
+            # Store the validated map
+            params['event_id_map'] = event_map
+            # Store validated parameters including the map
+            self.validated_params = params
+
+        except Exception as e:
+            self.log(f"V-Error: Unexpected error validating Event Map: {e}")
+            messagebox.showerror("Event Map Error", f"An unexpected error occurred during Event Map validation:\n{e}")
             return False
 
-        raw_ids = [e.get().strip() for e in self.condition_entries if e.get().strip()]
-        if not raw_ids:
-            self.log("V-Error: No Event IDs.")
-            messagebox.showerror("Event ID Error", "Enter at least one Event ID.")
-            return False
-        # Use the text strings as condition identifiers
-        self.current_event_ids_process = sorted(list(set(raw_ids)))
-        self.log("Inputs Validated.")
-        self.log(f"Params: {self.validated_params}")
-        self.log(f"Event IDs: {self.current_event_ids_process}")
+        # --- End Event Map Validation ---
+
+        self.log("Inputs Validated Successfully.")
+        self.log(f"Parameters: {self.validated_params}") # Includes event_id_map now
+        # self.log(f"Event Map: {self.validated_params['event_id_map']}") # Logged within params
         return True
 
-    # --- Periodic Queue Check (Main Processing) ---
+
+    # --- Periodic Queue Check (Main Processing - Unchanged) ---
     def _periodic_queue_check(self):
         processing_done = False
         final_success = True
@@ -701,13 +913,19 @@ class FPVSApp(ctk.CTk):
             while True:
                 message = self.gui_queue.get_nowait()
                 msg_type = message.get('type')
+
+                # ignore detection‐thread messages
                 if msg_type in ['detection_result', 'detection_error', 'detection_done']:
                     continue
-                elif msg_type == 'log':
+
+                if msg_type == 'log':
                     self.log(message.get('message', ''))
                 elif msg_type == 'progress':
                     value = message.get('value', 0)
-                    self.progress_bar.set(value / self._max_progress if self._max_progress > 0 else 0)
+                    progress_fraction = (value / self._max_progress) if self._max_progress > 0 else 0
+                    self.progress_bar.set(progress_fraction)
+                    # ── FORCE IMMEDIATE REDRAW ──
+                    self.update_idletasks()
                 elif msg_type == 'result':
                     self.preprocessed_data = message.get('data', {})
                     self.log("Preprocessing results received.")
@@ -718,7 +936,7 @@ class FPVSApp(ctk.CTk):
                     messagebox.showerror("Processing Error", error_msg)
                     processing_done = True
                     final_success = False
-                    print(tb)
+                    if tb: print(tb)
                 elif msg_type == 'done':
                     self.log("BG thread done.")
                     processing_done = True
@@ -740,7 +958,7 @@ class FPVSApp(ctk.CTk):
             self.log("Warn: Processing thread ended unexpectedly.")
             self._finalize_processing(False)
 
-    # --- Finalize Processing ---
+    # --- Finalize Processing (Unchanged) ---
     def _finalize_processing(self, success):
         self.progress_bar.set(1.0 if success else self.progress_bar.get())
         if success and self.preprocessed_data:
@@ -748,6 +966,7 @@ class FPVSApp(ctk.CTk):
             if has_data:
                 self.log("\n--- Starting Post-processing Phase ---")
                 try:
+                    # Pass the condition labels (keys of the dict) to post_process
                     self.post_process(list(self.preprocessed_data.keys()))
                 except Exception as post_err:
                     self.log(f"!!! Post-processing Error: {post_err}\n{traceback.format_exc()}")
@@ -760,250 +979,287 @@ class FPVSApp(ctk.CTk):
             messagebox.showinfo("Processing Finished", "Preprocessing OK, but no data available.\nNo Excel files generated.")
         else:
             self.log("--- Post-processing skipped due to errors ---")
+
         self._enable_controls(enable_process_buttons=True)
         self.log(f"--- Processing Run Finished at {pd.Timestamp.now()} ---")
         self.processing_thread = None
         gc.collect()
 
-    # --- Disable/Enable Controls ---
+
+    # --- Disable/Enable Controls (Updated for new widgets) ---
     def _disable_controls(self, enable_process_buttons=None):
+        """Disables GUI elements during processing."""
         widgets = []
-        if hasattr(self, 'select_button'):
-            widgets.append(self.select_button)
-        if hasattr(self, 'detect_button'):
-            widgets.append(self.detect_button)
-        if hasattr(self, 'add_cond_button'):
-            widgets.append(self.add_cond_button)
-        if hasattr(self, 'radio_single'):
-            widgets.append(self.radio_single)
-        if hasattr(self, 'radio_batch'):
-            widgets.append(self.radio_batch)
+        # Options Frame
+        if hasattr(self, 'select_button'): widgets.append(self.select_button)
+        if hasattr(self, 'radio_single'): widgets.append(self.radio_single)
+        if hasattr(self, 'radio_batch'): widgets.append(self.radio_batch)
         if hasattr(self, 'options_frame'):
             for w in self.options_frame.winfo_children():
-                if isinstance(w, ctk.CTkRadioButton) and w not in [self.radio_single, self.radio_batch]:
-                    widgets.append(w)
-        p_entries = [getattr(self, n, None) for n in [
+                 if isinstance(w, ctk.CTkRadioButton) and w not in [self.radio_single, self.radio_batch]:
+                     widgets.append(w)
+
+        # Params Frame (incl. stim channel)
+        param_widgets = [getattr(self, n, None) for n in [
             'low_pass_entry', 'high_pass_entry', 'downsample_entry',
             'epoch_start_entry', 'epoch_end_entry', 'reject_thresh_entry',
-            'ref_channel1_entry', 'ref_channel2_entry', 'max_idx_keep_entry'
+            'ref_channel1_entry', 'ref_channel2_entry', 'max_idx_keep_entry',
+            'stim_channel_entry', # Added
+            'save_preprocessed_checkbox'
         ]]
-        widgets.extend([e for e in p_entries if e])
-        if hasattr(self, 'params_frame'):
-            for w in self.params_frame.winfo_children():
-                if isinstance(w, ctk.CTkCheckBox):
-                    widgets.append(w)
-        for entry in self.condition_entries:
-            if entry and entry.winfo_exists():
-                widgets.append(entry)
-                p_frame = entry.master
-                if p_frame.winfo_exists():
-                    for w in p_frame.winfo_children():
-                        if isinstance(w, ctk.CTkButton):
-                            widgets.append(w)
+        widgets.extend([w for w in param_widgets if w])
+
+        # Event Map Frame
+        if hasattr(self, 'detect_button'): widgets.append(self.detect_button)
+        if hasattr(self, 'add_map_button'): widgets.append(self.add_map_button)
+        for entry_data in self.event_map_entries:
+             if entry_data['label'] and entry_data['label'].winfo_exists(): widgets.append(entry_data['label'])
+             if entry_data['id'] and entry_data['id'].winfo_exists(): widgets.append(entry_data['id'])
+             if entry_data['button'] and entry_data['button'].winfo_exists(): widgets.append(entry_data['button'])
+
+        # Save Frame
         if hasattr(self, 'save_frame'):
             for w in self.save_frame.winfo_children():
-                if isinstance(w, ctk.CTkButton):
-                    widgets.append(w)
+                if isinstance(w, ctk.CTkButton): widgets.append(w)
+
+        # Start Button
         if hasattr(self, 'start_button') and enable_process_buttons is False:
             widgets.append(self.start_button)
+
+        # Disable all
         for w in widgets:
-            if w and w.winfo_exists():
-                try:
-                    w.configure(state="disabled")
-                except Exception:
-                    pass
+             if w and w.winfo_exists():
+                 try: w.configure(state="disabled")
+                 except Exception: pass
         self.update_idletasks()
+
 
     def _enable_controls(self, enable_process_buttons=None):
+        """Enables GUI elements after processing."""
         widgets = []
-        if hasattr(self, 'select_button'):
-            widgets.append(self.select_button)
-        if hasattr(self, 'detect_button'):
-            widgets.append(self.detect_button)
-        if hasattr(self, 'add_cond_button'):
-            widgets.append(self.add_cond_button)
-        if hasattr(self, 'radio_single'):
-            widgets.append(self.radio_single)
-        if hasattr(self, 'radio_batch'):
-            widgets.append(self.radio_batch)
+        # Options Frame
+        if hasattr(self, 'select_button'): widgets.append(self.select_button)
+        if hasattr(self, 'radio_single'): widgets.append(self.radio_single)
+        if hasattr(self, 'radio_batch'): widgets.append(self.radio_batch)
         if hasattr(self, 'options_frame'):
-            for w in self.options_frame.winfo_children():
-                if isinstance(w, ctk.CTkRadioButton) and w not in [self.radio_single, self.radio_batch]:
-                    widgets.append(w)
-        p_entries = [getattr(self, n, None) for n in [
+             for w in self.options_frame.winfo_children():
+                  if isinstance(w, ctk.CTkRadioButton) and w not in [self.radio_single, self.radio_batch]:
+                      widgets.append(w)
+
+        # Params Frame (incl. stim channel)
+        param_widgets = [getattr(self, n, None) for n in [
             'low_pass_entry', 'high_pass_entry', 'downsample_entry',
             'epoch_start_entry', 'epoch_end_entry', 'reject_thresh_entry',
-            'ref_channel1_entry', 'ref_channel2_entry', 'max_idx_keep_entry'
+            'ref_channel1_entry', 'ref_channel2_entry', 'max_idx_keep_entry',
+            'stim_channel_entry', # Added
+            'save_preprocessed_checkbox'
         ]]
-        widgets.extend([e for e in p_entries if e])
-        if hasattr(self, 'params_frame'):
-            for w in self.params_frame.winfo_children():
-                if isinstance(w, ctk.CTkCheckBox):
-                    widgets.append(w)
-        if hasattr(self, 'conditions_scroll_frame'):
-            for entry_frame in self.conditions_scroll_frame.winfo_children():
-                if isinstance(entry_frame, ctk.CTkFrame) and entry_frame.winfo_exists():
-                    for w in entry_frame.winfo_children():
-                        if w and w.winfo_exists():
-                            widgets.append(w)
+        widgets.extend([w for w in param_widgets if w])
+
+        # Event Map Frame
+        if hasattr(self, 'detect_button'): widgets.append(self.detect_button)
+        if hasattr(self, 'add_map_button'): widgets.append(self.add_map_button)
+        for entry_data in self.event_map_entries:
+              if entry_data['label'] and entry_data['label'].winfo_exists(): widgets.append(entry_data['label'])
+              if entry_data['id'] and entry_data['id'].winfo_exists(): widgets.append(entry_data['id'])
+              if entry_data['button'] and entry_data['button'].winfo_exists(): widgets.append(entry_data['button'])
+
+        # Save Frame
         if hasattr(self, 'save_frame'):
             for w in self.save_frame.winfo_children():
-                if isinstance(w, ctk.CTkButton):
-                    widgets.append(w)
+                 if isinstance(w, ctk.CTkButton): widgets.append(w)
+
+        # Start Button
         if hasattr(self, 'start_button') and enable_process_buttons is True:
             widgets.append(self.start_button)
+
+        # Enable all
         for w in widgets:
-            if w and w.winfo_exists():
-                try:
-                    w.configure(state="normal")
-                except Exception:
-                    pass
+             if w and w.winfo_exists():
+                 try: w.configure(state="normal")
+                 except Exception: pass
         self.update_idletasks()
 
-    # --- Background Processing Thread Function ---
-    def _processing_thread_func(self, data_paths, params, conditions_ids_to_process, gui_queue):
-        local_data = {cond: [] for cond in conditions_ids_to_process}
+
+    # --- Background Processing Thread Function (Updated for find_events and map) ---
+    def _processing_thread_func(self, data_paths, params, gui_queue):
+        # --- No conditions_ids_to_process argument needed, map is in params ---
+        event_id_map = params['event_id_map'] # e.g., {'Cond1': 32, 'Cond2': 64}
+        condition_labels = list(event_id_map.keys()) # Get labels ['Cond1', 'Cond2']
+        stim_channel_name = params['stim_channel'] # Get stim channel from params
+
+        # Initialize local data storage using labels as keys
+        local_data = {label: [] for label in condition_labels}
         files_w_epochs = 0
         gc.collect()
+
         try:
             n_files = len(data_paths)
             for i, f_path in enumerate(data_paths):
                 f_name = os.path.basename(f_path)
                 gui_queue.put({'type': 'log', 'message': f"\nProcessing file {i+1}/{n_files}: {f_name}"})
-                raw, raw_proc, evts = None, None, None
+                raw, raw_proc = None, None # Removed evts variable
+                gc.collect()
+
                 try:
+                    # 1. Load Raw Data (Unchanged)
                     raw = self.load_eeg_file(f_path)
-                    if raw is None:
-                        continue
-                    # After pre-processing, extract events using annotations.
+                    if raw is None: continue
+
+                    # 2. Preprocess Raw Data (Unchanged, but uses stim_channel param implicitly if needed by funcs)
+                    # Pass the raw copy and other parameters from the validated dict
                     raw_proc = self.preprocess_raw(raw.copy(), **params)
                     if raw_proc is None:
+                        del raw; gc.collect()
                         continue
-                    events, event_dict = mne.events_from_annotations(raw_proc)
-                    if events is None or len(events) == 0:
-                        gui_queue.put({'type': 'log', 'message': "Info: No events found via annotations."})
-                        evts = None
+                    del raw; gc.collect()
+
+                    # 3. Find Numerical Events
+                    gui_queue.put({'type': 'log', 'message': f"Searching for numerical triggers on channel '{stim_channel_name}'..."})
+                    try:
+                         # Use find_events on the *preprocessed* data
+                         events = mne.find_events(raw_proc, stim_channel=stim_channel_name, consecutive=True, verbose=False)
+                         gui_queue.put({'type': 'log', 'message': f"Found {len(events)} event triggers."})
+                    except ValueError as find_err:
+                         # Handle case where stim channel isn't found *after* preprocessing (e.g., if dropped)
+                         gui_queue.put({'type': 'log', 'message': f"Warning: Could not find stim channel '{stim_channel_name}' after preprocessing in {f_name}. Skipping epoching for this file. Error: {find_err}"})
+                         events = None # Ensure events is None if find_events fails
+                    except Exception as find_err:
+                         gui_queue.put({'type': 'log', 'message': f"Warning: Error during mne.find_events for {f_name}. Skipping epoching. Error: {find_err}"})
+                         events = None
+
+                    # 4. Create Epochs for desired conditions using the map
+                    file_produced_epochs = False
+                    if events is not None and len(events) > 0:
+                         # Iterate through the Label:ID map provided by the user
+                         for label, number in event_id_map.items():
+                             try:
+                                 # Create epochs for *only* the current label/number pair
+                                 current_event_id = {label: number}
+                                 epochs = mne.Epochs(raw_proc, events,
+                                                     event_id=current_event_id,
+                                                     tmin=params['epoch_start'],
+                                                     tmax=params['epoch_end'],
+                                                     preload=False, # Load later
+                                                     verbose=False,
+                                                     baseline=None,
+                                                     on_missing='warn') # Warn if ID not in events
+
+                                 if len(epochs.events) > 0:
+                                     gui_queue.put({'type': 'log', 'message': f"  -> Created {len(epochs.events)} epochs for '{label}' (ID: {number})."})
+                                     # Append to the list associated with the label
+                                     local_data[label].append(epochs)
+                                     file_produced_epochs = True
+                                 # else: MNE automatically handles if the event ID isn't found in 'events' with on_missing='warn'
+
+                             except Exception as ep_err:
+                                 gui_queue.put({'type': 'log', 'message': f"!!! Epoch creation error for '{label}' (ID: {number}): {ep_err}\n{traceback.format_exc()}"})
+                         if file_produced_epochs:
+                             files_w_epochs += 1
                     else:
-                        gui_queue.put({'type': 'log', 'message': f"Found {len(events)} events. Event types: {list(event_dict.keys())}"})
-                        evts = (events, event_dict)
-                    file_epochs = False
-                    if evts is not None:
-                        events, event_dict = evts
-                        for cond in conditions_ids_to_process:
-                            if cond in event_dict:
-                                try:
-                                    # Create epochs for the condition using the text label.
-                                    epochs = mne.Epochs(raw_proc, events, event_id={cond: event_dict[cond]},
-                                                        tmin=params['epoch_start'], tmax=params['epoch_end'],
-                                                        preload=False, verbose=False, baseline=None, on_missing='warn')
-                                    if len(epochs.events) > 0:
-                                        gui_queue.put({'type': 'log', 'message': f"  Found {len(epochs.events)} epochs for condition {cond}."})
-                                        local_data[cond].append(epochs)
-                                        file_epochs = True
-                                except Exception as ep_err:
-                                    gui_queue.put({'type': 'log', 'message': f"Epoch error for condition {cond}: {ep_err}\n{traceback.format_exc()}"})
-                        if file_epochs:
-                            files_w_epochs += 1
-                    else:
-                        gui_queue.put({'type': 'log', 'message': "Skipping epochs (no events)."})
+                        gui_queue.put({'type': 'log', 'message': "Skipping epoch creation (no events found or error finding events)."})
+
+                    # 5. Optional: Save Preprocessed Data (Unchanged)
                     if params['save_preprocessed']:
-                        # Save with a name conforming to MNE conventions:
-                        p_path = os.path.join(os.path.dirname(f_path), f"{os.path.splitext(f_name)[0]}_preproc_raw.fif")
-                        try:
-                            raw_proc.save(p_path, overwrite=True, verbose=False)
-                        except Exception as s_err:
-                            gui_queue.put({'type': 'log', 'message': f"Warn: Save failed: {s_err}"})
+                         p_path = os.path.join(os.path.dirname(f_path), f"{os.path.splitext(f_name)[0]}_preproc_raw.fif")
+                         try:
+                             gui_queue.put({'type': 'log', 'message': f"Saving preprocessed to: {p_path}"})
+                             raw_proc.save(p_path, overwrite=True, verbose=False)
+                         except Exception as s_err:
+                             gui_queue.put({'type': 'log', 'message': f"Warn: Save failed: {s_err}"})
+
                 except MemoryError as mem_err:
-                    gui_queue.put({'type': 'error', 'message': f"Memory Error {f_name}: {mem_err}",
-                                   'traceback': traceback.format_exc()})
-                    return
+                     gui_queue.put({'type': 'error',
+                                     'message': f"Memory Error {f_name}: {mem_err}",
+                                     'traceback': traceback.format_exc()})
+                     del raw, raw_proc; gc.collect()
+                     return # Stop thread
                 except Exception as f_err:
                     gui_queue.put({'type': 'log', 'message': f"!!! FILE ERROR {f_name}: {f_err}\n{traceback.format_exc()}"})
                 finally:
-                    del raw, raw_proc, evts
+                    del raw_proc # Ensure cleanup
                     gc.collect()
                     gui_queue.put({'type': 'progress', 'value': i + 1})
-            gui_queue.put({'type': 'log', 'message': f"\n--- BG Preprocessing Done ({files_w_epochs} files with epochs) ---"})
+
+            # --- Loop Finished ---
+            gui_queue.put({'type': 'log', 'message': f"\n--- BG Preprocessing Done ---"})
+            gui_queue.put({'type': 'log', 'message': f"Found epochs for {files_w_epochs}/{n_files} files matching the specified Label:ID map."})
             gui_queue.put({'type': 'result', 'data': local_data})
+
         except MemoryError as mem_err:
-            gui_queue.put({'type': 'error', 'message': f"Critical Memory Error: {mem_err}",
-                           'traceback': traceback.format_exc()})
+             gui_queue.put({'type': 'error', 'message': f"Critical Memory Error: {mem_err}", 'traceback': traceback.format_exc()})
         except Exception as e:
-            gui_queue.put({'type': 'error', 'message': f"Critical thread error: {e}",
-                           'traceback': traceback.format_exc()})
+            gui_queue.put({'type': 'error', 'message': f"Critical thread error: {e}", 'traceback': traceback.format_exc()})
         finally:
             gui_queue.put({'type': 'done'})
 
-    # --- EEG Loading Method ---
+
+    # --- EEG Loading Method (Mostly unchanged, stim_channel handled later) ---
     def load_eeg_file(self, filepath):
-        """Loads BDF or SET file using MNE."""
+        """Loads BDF or SET file using MNE-Python."""
         ext = os.path.splitext(filepath)[1].lower()
         raw = None
         base_filename = os.path.basename(filepath)
         self.log(f"Loading: {base_filename}...")
+
         try:
             load_kwargs = {'preload': True, 'verbose': False}
+
             if ext == ".bdf":
-                try:
-                    self.log("Attempting BDF load with stim_channel='Status'.")
-                    with mne.utils.use_log_level('WARNING'):
-                        raw = mne.io.read_raw_bdf(filepath, stim_channel='Status', **load_kwargs)
-                    self.log("BDF loaded successfully with 'Status'.")
-                except ValueError as ve:
-                    if "could not find stim channel" in str(ve).lower() and "'status'" in str(ve).lower():
-                        self.log("Warning: 'Status' channel not found. Attempting load without specifying...")
-                        try:
-                            with mne.utils.use_log_level('WARNING'):
-                                raw = mne.io.read_raw_bdf(filepath, **load_kwargs)
-                            self.log("Loaded BDF without 'Status' (event detection may fail).")
-                        except Exception as fallback_load_err:
-                            self.log(f"Error loading BDF fallback: {fallback_load_err}")
-                            messagebox.showerror("Loading Error", f"Could not load BDF file:\n{base_filename}\n\nError: {fallback_load_err}")
-                            return None
-                    else:
-                        raise ve
-                except Exception as bdf_err:
-                    raise bdf_err
+                 try:
+                     self.log(f"Attempting BDF load, will find events later using specified stim channel ('{self.validated_params.get('stim_channel', DEFAULT_STIM_CHANNEL)}').")
+                     # Load without forcing 'Status', let find_events handle channel later
+                     with mne.utils.use_log_level('WARNING'):
+                          raw = mne.io.read_raw_bdf(filepath, **load_kwargs)
+                     self.log("BDF loaded successfully.")
+                 except Exception as bdf_err:
+                      raise bdf_err # Let outer handler catch load errors
+
             elif ext == ".set":
-                self.log("Attempting SET load.")
-                with mne.utils.use_log_level('WARNING'):
-                    raw = mne.io.read_raw_eeglab(filepath, **load_kwargs)
-                self.log("SET loaded successfully.")
+                 self.log("Attempting SET load.")
+                 with mne.utils.use_log_level('WARNING'):
+                     raw = mne.io.read_raw_eeglab(filepath, **load_kwargs)
+                 self.log("SET loaded successfully.")
             else:
-                self.log(f"Unsupported format '{ext}'.")
-                messagebox.showwarning("Unsupported File", f"Format '{ext}' not supported.")
-                return None
+                 self.log(f"Unsupported format '{ext}'.")
+                 messagebox.showwarning("Unsupported File", f"Format '{ext}' not supported.")
+                 return None
 
             if raw is None:
-                raise ValueError("MNE load returned None unexpectedly.")
+                 raise ValueError("MNE load returned None unexpectedly.")
+
             self.log(f"Load OK: {len(raw.ch_names)} channels @ {raw.info['sfreq']:.1f} Hz.")
             self.log("Applying standard_1020 montage...")
             try:
-                montage = mne.channels.make_standard_montage('standard_1020')
-                raw.set_montage(montage, on_missing='warn', match_case=False)
-                self.log("Montage applied (check warnings for missing channels like EXG).")
+                 montage = mne.channels.make_standard_montage('standard_1020')
+                 raw.set_montage(montage, on_missing='warn', match_case=False, verbose=False) # Match case False is important
+                 self.log("Montage applied (check warnings for missing channels like EXG or Stim).")
             except Exception as m_err:
-                self.log(f"Warning: Montage error: {m_err}")
-            return raw
-        except MemoryError:
-            self.log(f"!!! Memory Error loading {base_filename}.")
-            messagebox.showerror("Memory Error", f"Memory Error loading {base_filename}.")
-            return None
-        except ValueError as ve:
-            self.log(f"Value Error loading {base_filename}: {ve}")
-            messagebox.showerror("Loading Error", f"Could not load:\n{base_filename}\nValue Error: {ve}")
-            return None
-        except FileNotFoundError:
-            self.log(f"!!! File Not Found Error: {filepath}")
-            messagebox.showerror("Loading Error", f"File not found:\n{filepath}")
-            return None
-        except Exception as e:
-            self.log(f"!!! General Load Error {base_filename}: {e}\n{traceback.format_exc()}")
-            messagebox.showerror("Loading Error", f"Could not load:\n{base_filename}\nError: {e}")
-            return None
+                 self.log(f"Warning: Montage error: {m_err}")
 
-    # --- Preprocessing Method ---
+            return raw
+        except MemoryError as me:
+             self.log(f"!!! Memory Error loading {base_filename}: {me}")
+             messagebox.showerror("Memory Error", f"Memory Error loading {base_filename}.")
+             return None
+        # ... (other error handling unchanged) ...
+        except ValueError as ve:
+             self.log(f"Value Error loading {base_filename}: {ve}")
+             messagebox.showerror("Loading Error", f"Could not load:\n{base_filename}\nValue Error: {ve}")
+             return None
+        except FileNotFoundError:
+             self.log(f"!!! File Not Found Error: {filepath}")
+             messagebox.showerror("Loading Error", f"File not found:\n{filepath}")
+             return None
+        except Exception as e:
+             self.log(f"!!! General Load Error {base_filename}: {e}\n{traceback.format_exc()}")
+             messagebox.showerror("Loading Error", f"Could not load:\n{base_filename}\nError: {e}")
+             return None
+
+
+    # --- Preprocessing Method (Updated to preserve stim channel) ---
     def preprocess_raw(self, raw, **params):
+        """Applies the preprocessing steps to a raw MNE object."""
         downsample_rate = params.get('downsample_rate')
         low_pass = params.get('low_pass')
         high_pass = params.get('high_pass')
@@ -1011,52 +1267,64 @@ class FPVSApp(ctk.CTk):
         ref_channel1 = params.get('ref_channel1')
         ref_channel2 = params.get('ref_channel2')
         max_idx_keep = params.get('max_idx_keep')
+        # --- Get stim channel name ---
+        stim_channel_name = params.get('stim_channel', DEFAULT_STIM_CHANNEL)
+
         try:
             ch_names_orig = list(raw.info['ch_names'])
             n_chans_orig = len(ch_names_orig)
             self.log(f"Preprocessing {n_chans_orig} chans...")
-            # Apply bipolar reference using string labels.
+
+            # 1. Initial Bipolar Reference (Unchanged)
             if ref_channel1 and ref_channel2:
-                if ref_channel1 in ch_names_orig and ref_channel2 in ch_names_orig:
-                    new_ch = f"{ref_channel1}-{ref_channel2}"
+                 # ... (bipolar logic unchanged) ...
+                 if ref_channel1 in ch_names_orig and ref_channel2 in ch_names_orig:
+                    new_channel_name = f"{ref_channel1}-{ref_channel2}"
                     try:
                         self.log(f"Applying bipolar ref: {ref_channel1}-{ref_channel2}...")
-                        # Use set_bipolar_reference with string inputs.
-                        raw.set_bipolar_reference(ref_channel1, ref_channel2, new_ch,
-                                                  drop_refs=False, copy=False, verbose=False)
-                        self.log(f"OK. New channel '{new_ch}'.")
-                        ch_names_orig = list(raw.info['ch_names'])
+                        raw.set_bipolar_reference(ref_channel1, ref_channel2, new_channel_name, drop_refs=False, copy=False, verbose=False)
+                        self.log(f"OK. New channel '{new_channel_name}'.")
+                        ch_names_orig = list(raw.info['ch_names']) # Update names
                         n_chans_orig = len(ch_names_orig)
                     except Exception as bipol_err:
                         self.log(f"Warn: Bipolar ref failed: {bipol_err}.")
-                else:
-                    self.log(f"Warn: One or both reference channels ({ref_channel1}, {ref_channel2}) not found. Skipping bipolar ref.")
+                 else:
+                    self.log(f"Warn: One or both ref channels ({ref_channel1}, {ref_channel2}) not found. Skipping bipolar ref.")
             else:
                 self.log("Skip bipolar ref.")
 
-            # Drop channels while preserving any channel named "Status"
+
+            # 2. Drop channels (preserve stim channel)
+            # --- Modified to preserve stim channel ---
             if max_idx_keep is not None:
                 c_names = list(raw.info['ch_names'])
                 c_n = len(c_names)
-                status_chans = [ch for ch in c_names if ch.lower() == 'status']
+                # Find stim channel(s) matching the name (case sensitive)
+                stim_chans_found = [ch for ch in c_names if ch == stim_channel_name]
+
                 if 0 < max_idx_keep < c_n:
-                    # Retain first max_idx_keep channels plus any "Status" channels (without duplication)
-                    to_keep = list(dict.fromkeys([c_names[i] for i in range(max_idx_keep)] + status_chans))
+                    # Keep first max_idx_keep channels plus any matching stim channels
+                    to_keep = list(dict.fromkeys(
+                        [c_names[i] for i in range(max_idx_keep)] + stim_chans_found
+                    ))
                     to_drop = [ch for ch in c_names if ch not in to_keep]
                     if to_drop:
-                        self.log(f"Dropping {len(to_drop)} chans (keeping first {max_idx_keep} and 'Status' channel(s))...")
+                        self.log(f"Dropping {len(to_drop)} chans (keeping first {max_idx_keep} and stim channel '{stim_channel_name}')...")
                         try:
                             raw.drop_channels(to_drop)
                             self.log(f"OK. Remaining: {len(raw.ch_names)}")
                         except Exception as drop_err:
                             self.log(f"Warn: Drop failed: {drop_err}")
+                    else:
+                         self.log("No channels to drop based on Max Idx Keep & Stim channel criteria.")
                 elif max_idx_keep >= c_n:
-                    self.log("Info: Max Idx Keep >= chans. No drop.")
+                     self.log(f"Info: Max Idx Keep ({max_idx_keep}) >= chans ({c_n}). No drop.")
             else:
-                self.log("Skip index drop.")
+                 self.log("Skip index drop.")
 
-            # Downsampling
+            # 3. Downsampling (Unchanged)
             if downsample_rate:
+                 # ... (downsample logic unchanged) ...
                 c_sf = raw.info['sfreq']
                 self.log(f"Downsample check (Tgt: {downsample_rate}Hz). Curr: {c_sf:.1f}Hz.")
                 if c_sf > downsample_rate:
@@ -1072,30 +1340,34 @@ class FPVSApp(ctk.CTk):
             else:
                 self.log("Skip downsample.")
 
-            # Filtering
+
+            # 4. Filtering (Unchanged)
             l = low_pass if low_pass and low_pass > 0 else None
             h = high_pass
             if l or h:
-                try:
+                # ... (filter logic unchanged) ...
+                 try:
                     self.log(f"Filtering ({l if l else 'DC'}-{h if h else 'Nyq'}Hz)...")
                     raw.filter(l, h, method='fir', phase='zero-double', fir_window='hamming',
                                fir_design='firwin', pad='edge', verbose=False)
                     self.log("Filter OK.")
-                except Exception as f_err:
+                 except Exception as f_err:
                     self.log(f"Warn: Filter failed: {f_err}.")
             else:
-                self.log("Skip filter.")
+                 self.log("Skip filter.")
 
-            # Kurtosis-based channel rejection & interpolation
+
+            # 5. Kurtosis-based rejection & interpolation (Unchanged)
             if reject_thresh:
-                self.log(f"Kurtosis rejection (Z > {reject_thresh})...")
-                orig_bads = list(raw.info['bads'])
-                try:
+                 # ... (kurtosis logic unchanged, uses pick_types(eeg=True) so ignores stim channel) ...
+                 self.log(f"Kurtosis rejection (Z > {reject_thresh})...")
+                 orig_bads = list(raw.info['bads'])
+                 try:
                     picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
                     if len(picks) >= 2:
                         d = raw.get_data(picks)
                         k = kurtosis(d, axis=1, fisher=True, bias=False)
-                        del d
+                        del d; gc.collect()
                         k = np.nan_to_num(k)
                         m_val = np.mean(k)
                         s_val = np.std(k)
@@ -1106,12 +1378,17 @@ class FPVSApp(ctk.CTk):
                             bad_k = [names[i] for i, zv in enumerate(z) if abs(zv) > reject_thresh]
                         else:
                             self.log("Kurtosis std zero.")
+
                         if bad_k:
                             new_b = [c for c in bad_k if c not in raw.info['bads']]
-                            raw.info['bads'].extend(new_b)
-                            self.log(f"Bad by Kurt: {bad_k}. Bads: {raw.info['bads']}")
+                            if new_b:
+                                raw.info['bads'].extend(new_b)
+                                self.log(f"Bad by Kurt: {new_b}. Total bads: {raw.info['bads']}")
+                            else:
+                                self.log("No new bads by Kurtosis.")
                         else:
-                            self.log("No new bads by Kurtosis.")
+                            self.log("No channels exceeded kurtosis threshold.")
+
                         if raw.info['bads']:
                             if raw.get_montage():
                                 try:
@@ -1124,190 +1401,244 @@ class FPVSApp(ctk.CTk):
                                 self.log("Warn: No montage for interp.")
                     else:
                         self.log("Skip Kurtosis (<=1 EEG chan).")
-                except Exception as kurt_err:
-                    self.log(f"Warn: Kurtosis err: {kurt_err}.")
-                    raw.info['bads'] = orig_bads
+                 except Exception as kurt_err:
+                     self.log(f"Warn: Kurtosis err: {kurt_err}.")
+                     raw.info['bads'] = orig_bads # Restore bads on error
             else:
-                self.log("Skip Kurtosis.")
+                 self.log("Skip Kurtosis.")
 
-            # Apply average reference
+
+            # 6. Apply average reference (Unchanged)
             try:
-                self.log("Applying avg ref...")
-                raw.set_eeg_reference('average', projection=True)
-                self.log("Avg ref OK.")
+                 # ... (avg ref logic unchanged, uses set_eeg_reference so ignores stim channel) ...
+                 self.log("Applying avg ref...")
+                 raw.set_eeg_reference('average', projection=True, verbose=False)
+                 raw.apply_proj(verbose=False)
+                 self.log("Avg ref OK.")
             except Exception as avg_err:
-                self.log(f"Warn: Avg ref failed: {avg_err}")
+                 self.log(f"Warn: Avg ref failed: {avg_err}")
+
             self.log(f"Preproc OK. State: {len(raw.ch_names)} chans, {raw.info['sfreq']:.1f} Hz.")
             return raw
-        except MemoryError:
-            self.log("!!! Memory Error preprocessing.")
+        except MemoryError as me:
+            self.log(f"!!! Memory Error preprocessing: {me}")
             return None
         except Exception as e:
             self.log(f"!!! CRITICAL preproc error: {e}")
             print(traceback.format_exc())
             return None
 
-    # --- Post-processing Method ---
-    def post_process(self, conditions_ids_present):
-        self.log("--- Post-processing: Calculating Metrics & Saving Excel ---")
-        parent_folder = self.save_folder_path.get()
-        if not parent_folder or not os.path.isdir(parent_folder):
-            self.log(f"Error: Invalid save folder: '{parent_folder}'")
-            messagebox.showerror("Save Error", f"Invalid output folder:\n{parent_folder}")
-            return
+    def _focus_next_id_entry(self, event):
+        """
+        When Enter/Return is pressed in a Numerical ID CTkEntry,
+        move focus to the next ID field (and create it if it doesn’t exist).
+        """
+        widget = event.widget
+        target_idx = None
 
-        any_results_saved = False
-        for cond in conditions_ids_present:
-            epochs_list = self.preprocessed_data.get(cond, [])
-            event_name = f"Event_{cond}"
-            if not epochs_list:
-                continue
-            self.log(f"\nPost-processing {event_name} ({len(epochs_list)} file(s))...")
-            accum = {'fft': None, 'snr': None, 'z': None, 'bca': None}
-            valid_count = 0
-            n_ch, ch_names = None, None
-            for file_idx, epochs in enumerate(epochs_list):
-                self.log(f"  Processing File {file_idx+1}/{len(epochs_list)}...")
-                try:
-                    if not isinstance(epochs, mne.BaseEpochs) or len(epochs.events) == 0:
-                        self.log("    Invalid/empty Epochs. Skipping.")
-                        continue
-                    self.log(f"    Loading {len(epochs.events)} potential epochs...")
-                    epochs.load_data()
-                    picks = mne.pick_types(epochs.info, eeg=True, meg=False, stim=False, exclude='bads')
-                    if not picks.size:
-                        self.log("    No good EEG channels. Skipping.")
-                        continue
-                    ep_d = epochs.get_data(picks=picks, copy=False)
-                    n_ep, n_c, n_t = ep_d.shape
-                    sfreq = epochs.info['sfreq']
-                    names = [epochs.info['ch_names'][i] for i in picks]
-                    dur = n_t / sfreq
-                    self.log(f"    Processing {n_ep} epochs, {n_c} channels @ {sfreq:.1f}Hz. Duration: {dur:.2f}s")
-                    if n_ch is None:
-                        n_ch = n_c
-                        ch_names = names
-                        self.log(f"    Setting expected chan count={n_ch}.")
-                    elif n_ch != n_c or ch_names != names:
-                        self.log("    !!! Warning: Channel mismatch! Skipping file.")
-                        continue
+        # find which row this widget belongs to
+        for idx, entry in enumerate(self.event_map_entries):
+            ctkw = entry['id']  # your CTkEntry
+            internal = getattr(ctkw, "entry", None) or getattr(ctkw, "_entry", None)
+            # match either the CTkEntry or its internal tk.Entry
+            if ctkw is widget or internal is widget:
+                target_idx = idx
+                break
 
-                    fft_win_sec = 8.0
-                    n_fft = int(sfreq * fft_win_sec)
-                    if n_t < n_fft:
-                        self.log(f"    Warning: Epoch duration ({dur:.1f}s) < FFT window ({fft_win_sec:.1f}s).")
-                        n_fft = n_t
-                    n_overlap = int(n_fft * 0.50)
-                    fmin = epochs.info['lowpass'] if epochs.info.get('lowpass', 0) > 0 else 0.1
-                    fmax = epochs.info['highpass']
-                    self.log(f"    Calculating PSD (Welch: {fmin:.1f}-{fmax:.1f} Hz, N_FFT={n_fft})...")
-                    spec_d = epochs.compute_psd(method='welch', fmin=fmin, fmax=fmax,
-                                                  n_fft=n_fft, n_overlap=n_overlap, window='hann', average='mean', verbose=False)
-                    pow_d = spec_d.get_data(False)
-                    freqs = spec_d.freqs
-                    amp_d = np.sqrt(pow_d)
-                    self.log("    Calculating metrics...")
-                    n_tf = len(TARGET_FREQUENCIES)
-                    f_fft = np.zeros((n_c, n_tf))
-                    f_snr = np.zeros((n_c, n_tf))
-                    f_z = np.zeros((n_c, n_tf))
-                    f_bca = np.zeros((n_c, n_tf))
-                    noise_r, noise_e = 12, 1
-                    for c_idx in range(n_c):
-                        for f_idx, t_freq in enumerate(TARGET_FREQUENCIES):
-                            t_bin = np.argmin(np.abs(freqs - t_freq))
-                            l_b = max(0, t_bin - noise_r)
-                            u_b = min(len(freqs), t_bin + noise_r + 1)
-                            e_s = max(0, t_bin - noise_e)
-                            e_e = min(len(freqs), t_bin + noise_e + 1)
-                            n_idx = np.unique(np.concatenate([np.arange(l_b, e_s), np.arange(e_e, u_b)]))
-                            n_idx = n_idx[n_idx < len(freqs)]
-                            if n_idx.size >= 4:
-                                n_m = np.mean(amp_d[c_idx, n_idx])
-                                n_s = np.std(amp_d[c_idx, n_idx])
-                            else:
-                                n_m, n_s = 0, 0
-                            f_val = amp_d[c_idx, t_bin]
-                            s_val = f_val / n_m if n_m > 1e-12 else 0
-                            l_s = max(0, t_bin - 1)
-                            l_e = min(len(freqs), t_bin + 2)
-                            l_max = np.max(amp_d[c_idx, l_s:l_e]) if l_s < l_e else f_val
-                            z_val = (l_max - n_m) / n_s if n_s > 1e-12 else 0
-                            b_val = f_val - n_m
-                            f_fft[c_idx, f_idx] = f_val
-                            f_snr[c_idx, f_idx] = s_val
-                            f_z[c_idx, f_idx] = z_val
-                            f_bca[c_idx, f_idx] = b_val
-                    if accum['fft'] is None:
-                        accum = {'fft': f_fft, 'snr': f_snr, 'z': f_z, 'bca': f_bca}
+    def _add_row_and_focus_label(self, event):
+        """
+        When Enter/Return is pressed in either the Label or ID entry,
+        create a new row and focus its Label field.
+        """
+        # Add the new row
+        self.add_event_map_entry()
+        # Focus the label entry of the newly created row
+        self.event_map_entries[-1]['label'].focus_set()
+        # Prevent default behavior
+        return "break"
+
+    # --- Post-processing Method (Unchanged - uses labels from dict keys) ---
+
+
+def post_process(self, condition_labels_present):
+    """Calculates metrics (FFT, SNR, Z-score, BCA) using time-domain epoch averaging and saves to Excel."""
+    self.log("--- Post-processing: Calculating Metrics & Saving Excel ---")
+    parent_folder = self.save_folder_path.get()
+    if not parent_folder or not os.path.isdir(parent_folder):
+        self.log(f"Error: Invalid save folder: '{parent_folder}'")
+        messagebox.showerror("Save Error", f"Invalid output folder:\n{parent_folder}")
+        return
+
+    # Extract participant ID from first filename (e.g. "SC_P14.bdf" → "P14")
+    first_file = os.path.basename(self.data_paths[0])
+    pid = os.path.splitext(first_file)[0]
+    if "_" in pid:
+        pid = pid.split("_")[-1]
+
+    any_results_saved = False
+
+    for cond_label in condition_labels_present:
+        epochs_list = self.preprocessed_data.get(cond_label, [])
+        if not epochs_list:
+            self.log(f"\nSkipping post-processing for '{cond_label}': No epoch data.")
+            continue
+
+        self.log(f"\nPost-processing '{cond_label}' ({len(epochs_list)} file(s))...")
+        accum = {'fft': None, 'snr': None, 'z': None, 'bca': None}
+        valid_count = 0
+        electrode_names = None
+
+        for file_idx, epochs in enumerate(epochs_list):
+            self.log(f"  File {file_idx + 1}/{len(epochs_list)} for '{cond_label}'...")
+            gc.collect()
+            try:
+                if not isinstance(epochs, mne.BaseEpochs) or len(epochs.events) == 0:
+                    self.log("    Invalid or empty epochs. Skipping.")
+                    continue
+
+                epochs.load_data()
+                picks = mne.pick_types(epochs.info, eeg=True, exclude='bads')
+                if picks.size == 0:
+                    self.log("    No good EEG channels. Skipping.")
+                    continue
+
+                # Time-domain averaging over epochs
+                ep_data = epochs.get_data(picks=picks)  # [n_epochs, n_ch, n_t]
+                avg_data = np.mean(ep_data.astype(np.float64), axis=0)  # [n_ch, n_t]
+                n_ch, n_t = avg_data.shape
+                sfreq = epochs.info['sfreq']
+
+                # Build MATLAB-style freq vector
+                num_bins = n_t // 2 + 1
+                freqs = np.linspace(0, sfreq / 2.0, num=num_bins, endpoint=True)
+
+                # Single FFT on averaged waveform
+                fft_full = np.fft.fft(avg_data, axis=1)
+                fft_vals = np.abs(fft_full[:, :num_bins]) / n_t * 2  # [n_ch, num_bins]
+
+                # Determine electrode names once
+                if electrode_names is None:
+                    ch_names = [epochs.info['ch_names'][i] for i in picks]
+                    if n_ch == len(DEFAULT_ELECTRODE_NAMES_64) and ch_names == DEFAULT_ELECTRODE_NAMES_64:
+                        electrode_names = DEFAULT_ELECTRODE_NAMES_64
+                    elif n_ch == len(DEFAULT_ELECTRODE_NAMES_64):
+                        electrode_names = DEFAULT_ELECTRODE_NAMES_64
                     else:
-                        accum['fft'] += f_fft
-                        accum['snr'] += f_snr
-                        accum['z'] += f_z
-                        accum['bca'] += f_bca
-                    valid_count += 1
-                    self.log("    Accumulated metrics.")
-                except MemoryError:
-                    self.log("!!! Memory Error post-processing. Skipping file.")
-                    continue
-                except Exception as e:
-                    self.log(f"!!! Error post-processing: {e}\n{traceback.format_exc()}")
-                    continue
-                finally:
-                    del ep_d, spec_d, pow_d, amp_d
-                    gc.collect()
-            if valid_count > 0:
-                self.log(f"Averaging metrics across {valid_count} files for {event_name}.")
-                avg = {k: v / valid_count for k, v in accum.items()}
-                cols = [f"{f:.1f}_Hz" for f in TARGET_FREQUENCIES]
-                elecs = DEFAULT_ELECTRODE_NAMES_64 if n_ch == 64 else [f"Ch{i+1}" for i in range(n_ch)]
-                if n_ch != 64:
-                    self.log("Warn: Chan count != 64. Using generic names.")
-                dfs = {
-                    'FFT_Amplitude': pd.DataFrame(avg['fft'], index=elecs, columns=cols),
-                    'SNR': pd.DataFrame(avg['snr'], index=elecs, columns=cols),
-                    'Z_Score': pd.DataFrame(avg['z'], index=elecs, columns=cols),
-                    'BCA': pd.DataFrame(avg['bca'], index=elecs, columns=cols)
-                }
-                for df_n, df in dfs.items():
-                    df.insert(0, "Electrode", df.index)
-                sub_path = os.path.join(parent_folder, event_name)
-                excel_path = os.path.join(sub_path, f"{event_name}_FPVS_Results.xlsx")
-                try:
-                    os.makedirs(sub_path, exist_ok=True)
-                except OSError as e:
-                    self.log(f"Warn: Subfolder error: {e}. Saving to parent.")
-                    excel_path = os.path.join(parent_folder, f"{event_name}_FPVS_Results.xlsx")
-                try:
-                    self.log(f"Writing Excel: {excel_path}")
-                    with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
-                        for name, df in dfs.items():
-                            df.to_excel(writer, sheet_name=name.replace('_', ' '), index=False)
-                        wb = writer.book
-                        cf = wb.add_format({'align': 'center', 'valign': 'vcenter'})
-                        for sn in writer.sheets:
-                            ws = writer.sheets[sn]
-                            c_df = dfs.get(sn.replace(' ', '_'))
-                            if c_df is None:
-                                continue
-                            for c_idx, c_name in enumerate(c_df.columns):
-                                w = max(len(str(c_name)), c_df[c_name].astype(str).map(len).max() if not c_df[c_name].empty else 0) + 4
-                                ws.set_column(c_idx, c_idx, w, cf)
-                    self.log(f"Saved Excel for {event_name}.")
-                    any_results_saved = True
-                except Exception as ex_err:
-                    self.log(f"!!! Excel Error {excel_path}: {ex_err}")
-                    messagebox.showerror("Excel Error", f"Failed save for {event_name}.\n{ex_err}")
-            else:
-                self.log(f"No valid data for {event_name}. No Excel generated.")
-        if any_results_saved:
-            self.log("Post-processing complete. Results saved.")
-        else:
-            self.log("Post-processing complete. No results generated.")
+                        electrode_names = [f"Ch{i + 1}" for i in range(n_ch)]
 
-# --- Main execution block ---
+                # Allocate arrays for metrics
+                n_tf = len(TARGET_FREQUENCIES)
+                f_fft = np.zeros((n_ch, n_tf))
+                f_snr = np.zeros((n_ch, n_tf))
+                f_z = np.zeros((n_ch, n_tf))
+                f_bca = np.zeros((n_ch, n_tf))
+
+                # Compute metrics
+                for c_idx in range(n_ch):
+                    for f_idx, t_freq in enumerate(TARGET_FREQUENCIES):
+                        if not (freqs[0] <= t_freq <= freqs[-1]):
+                            continue
+                        t_bin = np.argmin(np.abs(freqs - t_freq))
+
+                        # MATLAB-style noise window: 25 bins, exclude offsets -2,-1,0
+                        low, high = t_bin - 12, t_bin + 13
+                        exclude = {t_bin - 2, t_bin - 1, t_bin}
+                        noise_idx = [
+                            i for i in range(low, high)
+                            if 0 <= i < len(freqs) and i not in exclude
+                        ]
+
+                        if len(noise_idx) >= 4:
+                            noise_mean = fft_vals[c_idx, noise_idx].mean()
+                            noise_std = fft_vals[c_idx, noise_idx].std()
+                        else:
+                            noise_mean = noise_std = 0
+
+                        amp_val = fft_vals[c_idx, t_bin]
+                        snr_val = amp_val / noise_mean if noise_mean > 1e-12 else 0
+                        peak = fft_vals[c_idx, max(0, t_bin - 1):min(len(freqs), t_bin + 2)].max()
+                        z_val = (peak - noise_mean) / noise_std if noise_std > 1e-12 else 0
+                        bca_val = amp_val - noise_mean
+
+                        f_fft[c_idx, f_idx] = amp_val
+                        f_snr[c_idx, f_idx] = snr_val
+                        f_z[c_idx, f_idx] = z_val
+                        f_bca[c_idx, f_idx] = bca_val
+
+                # Accumulate
+                if accum['fft'] is None:
+                    accum = {'fft': f_fft, 'snr': f_snr, 'z': f_z, 'bca': f_bca}
+                else:
+                    accum['fft'] += f_fft
+                    accum['snr'] += f_snr
+                    accum['z'] += f_z
+                    accum['bca'] += f_bca
+                valid_count += 1
+
+            except Exception as e:
+                self.log(f"!!! Error in post-processing file: {e}")
+            finally:
+                gc.collect()
+
+        # Average and save if data present
+        if valid_count > 0 and electrode_names:
+            avg = {k: v / valid_count for k, v in accum.items()}
+            cols = [f"{f:.1f}_Hz" for f in TARGET_FREQUENCIES]
+
+            dfs = {
+                'FFT Amplitude': pd.DataFrame(avg['fft'], index=electrode_names, columns=cols),
+                'SNR': pd.DataFrame(avg['snr'], index=electrode_names, columns=cols),
+                'Z Score': pd.DataFrame(avg['z'], index=electrode_names, columns=cols),
+                'BCA': pd.DataFrame(avg['bca'], index=electrode_names, columns=cols)
+            }
+            for df in dfs.values():
+                df.insert(0, 'Electrode', df.index)
+
+            # Folder named as condition label
+            folder_name = cond_label.replace('/', '-').strip()
+            sub_path = os.path.join(parent_folder, folder_name)
+            os.makedirs(sub_path, exist_ok=True)
+
+            # File named "PID condition_label.xlsx"
+            safe_label = folder_name
+            excel_filename = f"{pid} {safe_label}.xlsx"
+            excel_path = os.path.join(sub_path, excel_filename)
+
+            self.log(f"Writing Excel: {excel_path}")
+            with pd.ExcelWriter(excel_path, engine='xlsxwriter') as writer:
+                workbook = writer.book
+                center_fmt = workbook.add_format({'align': 'center', 'valign': 'vcenter'})
+                for sheet_name, df in dfs.items():
+                    df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    worksheet = writer.sheets[sheet_name]
+                    for col_idx, col_name in enumerate(df.columns):
+                        header_len = len(str(col_name))
+                        try:
+                            mx = df[col_name].astype(str).map(len).max()
+                            if pd.isna(mx):
+                                mx = header_len
+                        except:
+                            mx = header_len
+                        width = max(header_len, int(mx)) + 4
+                        worksheet.set_column(col_idx, col_idx, width, center_fmt)
+
+            self.log(f"Saved Excel for '{cond_label}'.")
+            any_results_saved = True
+        else:
+            self.log(f"No valid data for '{cond_label}'. No Excel generated.")
+
+    # Final message
+    if any_results_saved:
+        self.log("Post-processing complete. Results saved.")
+        messagebox.showinfo("Processing Complete", "Analysis finished and Excel files saved successfully.")
+    else:
+        self.log("Post-processing complete. No results generated.")
+
+
+# --- Main execution block (Unchanged) ---
 if __name__ == "__main__":
     try:
+        # Improve DPI awareness on Windows if possible
         from ctypes import windll
         windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
